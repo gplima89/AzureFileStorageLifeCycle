@@ -23,7 +23,7 @@ A PowerShell solution to implement lifecycle management rules for Azure SMB File
 ### 1. Clone the Repository
 
 ```bash
-git clone [https://github.com/your-org/AzureFileStorageLifeCycle.git](https://github.com/gplima89/AzureFileStorageLifeCycle.git)
+git clone https://github.com/your-org/AzureFileStorageLifeCycle.git
 cd AzureFileStorageLifeCycle
 ```
 
