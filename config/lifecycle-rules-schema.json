@@ -1,0 +1,184 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "Azure File Storage Lifecycle Rules Configuration",
+    "description": "Schema for Azure File Storage lifecycle management rules",
+    "type": "object",
+    "required": ["version", "globalSettings", "storageAccounts"],
+    "properties": {
+        "$schema": {
+            "type": "string",
+            "description": "Reference to the schema file"
+        },
+        "description": {
+            "type": "string",
+            "description": "Description of the configuration"
+        },
+        "version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+\\.\\d+$",
+            "description": "Configuration version in semver format"
+        },
+        "globalSettings": {
+            "type": "object",
+            "required": ["auditLogStorageAccount", "auditLogContainer"],
+            "properties": {
+                "dryRun": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "If true, no actual changes are made, only logged"
+                },
+                "logLevel": {
+                    "type": "string",
+                    "enum": ["Debug", "Information", "Warning", "Error"],
+                    "default": "Information",
+                    "description": "Logging verbosity level"
+                },
+                "auditLogStorageAccount": {
+                    "type": "string",
+                    "description": "Storage account name for audit logs"
+                },
+                "auditLogContainer": {
+                    "type": "string",
+                    "description": "Container name for audit logs"
+                },
+                "fileInventoryContainer": {
+                    "type": "string",
+                    "description": "Container name for file inventory reports"
+                },
+                "retainAuditLogsDays": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 90,
+                    "description": "Number of days to retain audit logs"
+                },
+                "maxParallelOperations": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 10,
+                    "description": "Maximum number of parallel operations"
+                },
+                "excludePatterns": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "File patterns to exclude from processing"
+                }
+            }
+        },
+        "storageAccounts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["name", "resourceGroup", "subscriptionId", "fileShares"],
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Storage account name"
+                    },
+                    "resourceGroup": {
+                        "type": "string",
+                        "description": "Resource group containing the storage account"
+                    },
+                    "subscriptionId": {
+                        "type": "string",
+                        "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                        "description": "Azure subscription ID"
+                    },
+                    "enabled": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Whether this storage account is processed"
+                    },
+                    "fileShares": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["name", "rules"],
+                            "properties": {
+                                "name": {
+                                    "type": "string",
+                                    "description": "File share name"
+                                },
+                                "enabled": {
+                                    "type": "boolean",
+                                    "default": true,
+                                    "description": "Whether this file share is processed"
+                                },
+                                "rules": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "required": ["name", "action", "conditions"],
+                                        "properties": {
+                                            "name": {
+                                                "type": "string",
+                                                "description": "Rule name for identification"
+                                            },
+                                            "enabled": {
+                                                "type": "boolean",
+                                                "default": true,
+                                                "description": "Whether this rule is active"
+                                            },
+                                            "action": {
+                                                "type": "string",
+                                                "enum": ["delete", "moveToCool", "moveToArchive"],
+                                                "description": "Action to perform on matching files"
+                                            },
+                                            "conditions": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "lastModifiedDaysAgo": {
+                                                        "type": "integer",
+                                                        "minimum": 1,
+                                                        "description": "Minimum days since last modification"
+                                                    },
+                                                    "lastAccessedDaysAgo": {
+                                                        "type": "integer",
+                                                        "minimum": 1,
+                                                        "description": "Minimum days since last access"
+                                                    },
+                                                    "createdDaysAgo": {
+                                                        "type": "integer",
+                                                        "minimum": 1,
+                                                        "description": "Minimum days since creation"
+                                                    },
+                                                    "pathPrefix": {
+                                                        "type": "string",
+                                                        "description": "Path prefix filter"
+                                                    },
+                                                    "pathSuffix": {
+                                                        "type": "string",
+                                                        "description": "Path suffix filter"
+                                                    },
+                                                    "fileExtensions": {
+                                                        "type": "array",
+                                                        "items": {
+                                                            "type": "string"
+                                                        },
+                                                        "description": "File extensions to include"
+                                                    },
+                                                    "minSizeBytes": {
+                                                        "type": "integer",
+                                                        "minimum": 0,
+                                                        "description": "Minimum file size in bytes"
+                                                    },
+                                                    "maxSizeBytes": {
+                                                        "type": "integer",
+                                                        "minimum": 0,
+                                                        "description": "Maximum file size in bytes"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
