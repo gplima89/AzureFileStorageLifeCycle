@@ -335,7 +335,10 @@ function Add-FileInventoryEntry {
         [datetime]$Created,
         
         [Parameter(Mandatory = $false)]
-        [string]$FileExtension = ""
+        [string]$FileExtension = "",
+        
+        [Parameter(Mandatory = $false)]
+        [string]$FileHash = ""
     )
     
     $entry = [PSCustomObject]@{
@@ -350,6 +353,9 @@ function Add-FileInventoryEntry {
         LastModified      = $LastModified
         Created           = $Created
         AgeInDays         = if ($LastModified) { [math]::Round((Get-Date).Subtract($LastModified).TotalDays, 0) } else { $null }
+        FileHash          = $FileHash
+        IsDuplicate       = "No"
+        DuplicateCount    = 0
         ScanTimestamp     = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     }
     
@@ -489,6 +495,67 @@ function Get-AllFilesRecursive {
     return $files
 }
 
+function Get-AzureFileHash {
+    <#
+    .SYNOPSIS
+        Calculates MD5 hash for a file in Azure File Share
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Context,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$ShareName,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+        
+        [Parameter(Mandatory = $false)]
+        [long]$MaxSizeForHash = 100MB
+    )
+    
+    try {
+        # Get file object
+        $file = Get-AzStorageFile -Context $Context -ShareName $ShareName -Path $FilePath -ErrorAction Stop
+        
+        # Skip hash calculation for very large files to avoid performance issues
+        if ($file.Length -gt $MaxSizeForHash) {
+            return "SKIPPED_TOO_LARGE"
+        }
+        
+        # Get file properties which includes ContentMD5 if set
+        $fileProperties = $file.FetchAttributes()
+        
+        # If ContentMD5 is already set, use it
+        if ($file.Properties.ContentMD5) {
+            return [System.Convert]::ToBase64String([System.Convert]::FromBase64String($file.Properties.ContentMD5))
+        }
+        
+        # Otherwise, download and calculate hash
+        $tempFile = [System.IO.Path]::GetTempFileName()
+        try {
+            Get-AzStorageFileContent -Context $Context -ShareName $ShareName -Path $FilePath -Destination $tempFile -Force -ErrorAction Stop | Out-Null
+            
+            $md5 = [System.Security.Cryptography.MD5]::Create()
+            $stream = [System.IO.File]::OpenRead($tempFile)
+            $hash = [System.BitConverter]::ToString($md5.ComputeHash($stream)).Replace("-", "")
+            $stream.Close()
+            
+            return $hash
+        }
+        finally {
+            if (Test-Path $tempFile) {
+                Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    catch {
+        Write-Log "Error calculating hash for '$FilePath': $_" -Level Warning
+        return "ERROR"
+    }
+}
+
 function Process-FileShare {
     <#
     .SYNOPSIS
@@ -520,15 +587,30 @@ function Process-FileShare {
     $allFiles = Get-AllFilesRecursive -Context $StorageContext -ShareName $shareName
     Write-Log "Found $($allFiles.Count) files in share: $shareName" -Level Information
     
-    # Add all files to inventory
+    # Calculate file hashes and add to inventory
+    Write-Log "Calculating file hashes and building inventory..." -Level Information
+    $processedCount = 0
     foreach ($file in $allFiles) {
+        $processedCount++
+        if ($processedCount % 100 -eq 0) {
+            Write-Log "Processed $processedCount of $($allFiles.Count) files..." -Level Information
+        }
+        
+        # Calculate hash for duplicate detection
+        $fileHash = Get-AzureFileHash `
+            -Context $StorageContext `
+            -ShareName $shareName `
+            -FilePath $file.FullPath `
+            -MaxSizeForHash 100MB
+        
         Add-FileInventoryEntry `
             -StorageAccount $StorageAccountName `
             -FileShare $shareName `
             -FilePath $file.FullPath `
             -FileSizeBytes $file.Length `
             -LastModified $file.LastModified `
-            -Created $file.Properties.CreatedOn
+            -Created $file.Properties.CreatedOn `
+            -FileHash $fileHash
         
         $script:TotalFilesProcessed++
         $script:TotalBytesProcessed += $file.Length
@@ -751,6 +833,109 @@ function Export-FileInventory {
     }
 }
 
+function Export-DuplicateFilesReport {
+    <#
+    .SYNOPSIS
+        Exports duplicate files report to CSV and uploads to Blob storage
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$StorageContext,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$ContainerName,
+        
+        [Parameter(Mandatory = $true)]
+        [hashtable]$DuplicateGroups,
+        
+        [Parameter(Mandatory = $false)]
+        [switch]$DryRun
+    )
+    
+    if ($DuplicateGroups.Count -eq 0) {
+        Write-Log "No duplicate files to export" -Level Information
+        return
+    }
+    
+    $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+    $fileName = "duplicate-files_$timestamp.csv"
+    $localPath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), $fileName)
+    
+    try {
+        # Build duplicate file report
+        $duplicateReport = [System.Collections.Generic.List[PSCustomObject]]::new()
+        
+        foreach ($hash in $DuplicateGroups.Keys) {
+            $files = $DuplicateGroups[$hash]
+            $fileSize = $files[0].FileSizeBytes
+            $wastedSpace = $fileSize * ($files.Count - 1)
+            
+            $duplicateReport.Add([PSCustomObject]@{
+                FileHash           = $hash
+                FileName           = $files[0].FileName
+                FileExtension      = $files[0].FileExtension
+                FileSizeBytes      = $fileSize
+                FileSizeMB         = [math]::Round($fileSize / 1MB, 2)
+                FileSizeGB         = [math]::Round($fileSize / 1GB, 4)
+                DuplicateCount     = $files.Count
+                WastedSpaceBytes   = $wastedSpace
+                WastedSpaceMB      = [math]::Round($wastedSpace / 1MB, 2)
+                WastedSpaceGB      = [math]::Round($wastedSpace / 1GB, 4)
+                StorageAccounts    = ($files | Select-Object -ExpandProperty StorageAccount -Unique) -join '; '
+                FileShares         = ($files | Select-Object -ExpandProperty FileShare -Unique) -join '; '
+                AllLocations       = ($files | Select-Object -ExpandProperty FilePath) -join ' | '
+            })
+        }
+        
+        # Sort by wasted space descending
+        $duplicateReport | Sort-Object -Property WastedSpaceBytes -Descending | Export-Csv -Path $localPath -NoTypeInformation -Encoding UTF8
+        
+        Write-Log "Duplicate files report exported to: $localPath ($($duplicateReport.Count) groups)" -Level Information
+        
+        if (-not $DryRun) {
+            # Ensure container exists
+            $container = Get-AzStorageContainer -Context $StorageContext -Name $ContainerName -ErrorAction SilentlyContinue
+            if (-not $container) {
+                New-AzStorageContainer -Context $StorageContext -Name $ContainerName -Permission Off | Out-Null
+            }
+            
+            # Upload to Blob storage
+            Set-AzStorageBlobContent `
+                -Context $StorageContext `
+                -Container $ContainerName `
+                -File $localPath `
+                -Blob $fileName `
+                -Force | Out-Null
+            
+            Write-Log "Duplicate files report uploaded to Blob storage: $ContainerName/$fileName" -Level Information
+            
+            # Also upload a "latest" version
+            $latestFileName = "duplicate-files_latest.csv"
+            Set-AzStorageBlobContent `
+                -Context $StorageContext `
+                -Container $ContainerName `
+                -File $localPath `
+                -Blob $latestFileName `
+                -Force | Out-Null
+            
+            Write-Log "Latest duplicate files report updated: $ContainerName/$latestFileName" -Level Information
+        }
+        else {
+            Write-Log "[DRY RUN] Would upload duplicate files report to: $ContainerName/$fileName" -Level Information
+        }
+    }
+    catch {
+        Write-Log "Failed to export/upload duplicate files report: $_" -Level Error
+    }
+    finally {
+        # Clean up local file
+        if (Test-Path $localPath) {
+            Remove-Item $localPath -Force
+        }
+    }
+}
+
 function Write-ExecutionSummary {
     <#
     .SYNOPSIS
@@ -852,6 +1037,54 @@ try {
         }
     }
     
+    # Detect duplicate files
+    Write-Log "Analyzing files for duplicates..." -Level Information
+    $duplicateGroups = @{}
+    
+    # Group files by size first (quick pre-filter)
+    $filesBySize = $script:FileInventory | Group-Object -Property FileSizeBytes | Where-Object { $_.Count -gt 1 }
+    
+    if ($filesBySize.Count -gt 0) {
+        Write-Log "Found $($filesBySize.Count) size groups with potential duplicates" -Level Information
+        
+        foreach ($sizeGroup in $filesBySize) {
+            $filesInGroup = $sizeGroup.Group
+            
+            # Group by hash within this size group
+            $hashGroups = $filesInGroup | 
+                Where-Object { $_.FileHash -and $_.FileHash -ne "SKIPPED_TOO_LARGE" -and $_.FileHash -ne "ERROR" } | 
+                Group-Object -Property FileHash | 
+                Where-Object { $_.Count -gt 1 }
+            
+            foreach ($hashGroup in $hashGroups) {
+                $hash = $hashGroup.Name
+                $duplicates = $hashGroup.Group
+                
+                if ($duplicates.Count -gt 1) {
+                    $duplicateGroups[$hash] = $duplicates
+                    
+                    # Update inventory entries
+                    foreach ($file in $duplicates) {
+                        $file.IsDuplicate = "Yes"
+                        $file.DuplicateCount = $duplicates.Count
+                    }
+                }
+            }
+        }
+        
+        Write-Log "Found $($duplicateGroups.Count) groups of duplicate files" -Level Information
+        $totalDuplicates = ($duplicateGroups.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
+        $wastedSpace = 0
+        foreach ($hash in $duplicateGroups.Keys) {
+            $files = $duplicateGroups[$hash]
+            $wastedSpace += $files[0].FileSizeBytes * ($files.Count - 1)
+        }
+        Write-Log "Total duplicate files: $totalDuplicates (wasting $([math]::Round($wastedSpace / 1GB, 2)) GB)" -Level Warning
+    }
+    else {
+        Write-Log "No duplicate files found" -Level Information
+    }
+    
     # Export audit log and file inventory
     if ($auditStorageContext) {
         Export-AuditLog `
@@ -863,6 +1096,15 @@ try {
             -StorageContext $auditStorageContext `
             -ContainerName $config.globalSettings.fileInventoryContainer `
             -DryRun:$script:DryRunMode
+        
+        # Export duplicate files report if duplicates found
+        if ($duplicateGroups.Count -gt 0) {
+            Export-DuplicateFilesReport `
+                -StorageContext $auditStorageContext `
+                -ContainerName $config.globalSettings.fileInventoryContainer `
+                -DuplicateGroups $duplicateGroups `
+                -DryRun:$script:DryRunMode
+        }
     }
     else {
         Write-Log "Audit storage context not available. Exporting logs locally only." -Level Warning

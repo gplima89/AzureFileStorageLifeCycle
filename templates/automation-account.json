@@ -105,23 +105,6 @@
             }
         },
         {
-            "type": "Microsoft.Automation/automationAccounts/runbooks",
-            "apiVersion": "2015-10-31",
-            "name": "[concat(parameters('automationAccountName'), '/', parameters('runbookName'))]",
-            "location": "[parameters('location')]",
-            "dependsOn": [
-                "[resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName'))]",
-                "[resourceId('Microsoft.Automation/automationAccounts/modules', parameters('automationAccountName'), 'Az.Storage')]"
-            ],
-            "properties": {
-                "runbookType": "PowerShell",
-                "logVerbose": true,
-                "logProgress": true,
-                "logActivityTrace": 1,
-                "description": "[variables('runbookDescription')]"
-            }
-        },
-        {
             "type": "Microsoft.Automation/automationAccounts/schedules",
             "apiVersion": "2015-10-31",
             "name": "[concat(parameters('automationAccountName'), '/', parameters('scheduleName'))]",
@@ -132,32 +115,13 @@
                 "description": "[variables('scheduleDescription')]",
                 "startTime": "[parameters('scheduleStartTime')]",
                 "expiryTime": "9999-12-31T23:59:59+00:00",
+                "interval": 1,
                 "frequency": "Week",
                 "timeZone": "[parameters('timeZone')]",
                 "advancedSchedule": {
                     "weekDays": [
                         "Sunday"
                     ]
-                }
-            }
-        },
-        {
-            "type": "Microsoft.Automation/automationAccounts/jobSchedules",
-            "apiVersion": "2015-10-31",
-            "name": "[concat(parameters('automationAccountName'), '/', guid(parameters('runbookName'), parameters('scheduleName')))]",
-            "dependsOn": [
-                "[resourceId('Microsoft.Automation/automationAccounts/runbooks', parameters('automationAccountName'), parameters('runbookName'))]",
-                "[resourceId('Microsoft.Automation/automationAccounts/schedules', parameters('automationAccountName'), parameters('scheduleName'))]"
-            ],
-            "properties": {
-                "schedule": {
-                    "name": "[parameters('scheduleName')]"
-                },
-                "runbook": {
-                    "name": "[parameters('runbookName')]"
-                },
-                "parameters": {
-                    "ConfigurationPath": "[concat('https://', parameters('configurationStorageAccountName'), '.blob.core.windows.net/', parameters('configurationContainerName'), '/lifecycle-rules.json')]"
                 }
             }
         },

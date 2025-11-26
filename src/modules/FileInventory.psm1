@@ -57,7 +57,16 @@ function New-FileInventoryEntry {
         [datetime]$Created,
         
         [Parameter(Mandatory = $false)]
-        [string]$ContentType = ""
+        [string]$ContentType = "",
+        
+        [Parameter(Mandatory = $false)]
+        [string]$FileHash = "",
+        
+        [Parameter(Mandatory = $false)]
+        [bool]$IsDuplicate = $false,
+        
+        [Parameter(Mandatory = $false)]
+        [int]$DuplicateCount = 0
     )
     
     $fileName = [System.IO.Path]::GetFileName($FilePath)
@@ -88,6 +97,9 @@ function New-FileInventoryEntry {
         AgeBucket            = Get-AgeBucket -AgeInDays $(if ($LastModified) { [math]::Round((Get-Date).Subtract($LastModified).TotalDays, 0) } else { 0 })
         SizeBucket           = Get-SizeBucket -SizeInBytes $FileSizeBytes
         ContentType          = $ContentType
+        FileHash             = $FileHash
+        IsDuplicate          = if ($IsDuplicate) { "Yes" } else { "No" }
+        DuplicateCount       = $DuplicateCount
         ScanTimestamp        = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         ScanTimestampUTC     = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
     }
@@ -357,6 +369,171 @@ function Get-DirectoryTreeData {
     return $treeData | Sort-Object -Property TotalSizeBytes -Descending
 }
 
+function Find-DuplicateFiles {
+    <#
+    .SYNOPSIS
+        Identifies duplicate files based on size and content hash
+        
+    .DESCRIPTION
+        Analyzes file inventory to find duplicates. Files are considered duplicates if they have:
+        - Same file size (quick check)
+        - Same content hash (computed for files with matching sizes)
+        
+    .PARAMETER FileInventory
+        Collection of file inventory entries
+        
+    .PARAMETER UpdateInventory
+        If specified, updates the IsDuplicate and DuplicateCount properties in the inventory
+        
+    .OUTPUTS
+        Returns a hashtable with hash as key and array of duplicate file entries as value
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject[]]$FileInventory,
+        
+        [Parameter(Mandatory = $false)]
+        [switch]$UpdateInventory
+    )
+    
+    Write-Verbose "Analyzing $($FileInventory.Count) files for duplicates..."
+    
+    # Group files by size first (quick pre-filter)
+    $filesBySize = $FileInventory | Group-Object -Property FileSizeBytes | Where-Object { $_.Count -gt 1 }
+    
+    if ($filesBySize.Count -eq 0) {
+        Write-Verbose "No files with matching sizes found"
+        return @{}
+    }
+    
+    Write-Verbose "Found $($filesBySize.Count) size groups with potential duplicates"
+    
+    # For files with matching sizes, group by hash
+    $duplicateGroups = @{}
+    
+    foreach ($sizeGroup in $filesBySize) {
+        $filesInGroup = $sizeGroup.Group
+        
+        # Group by hash within this size group
+        $hashGroups = $filesInGroup | 
+            Where-Object { $_.FileHash } | 
+            Group-Object -Property FileHash | 
+            Where-Object { $_.Count -gt 1 }
+        
+        foreach ($hashGroup in $hashGroups) {
+            $hash = $hashGroup.Name
+            $duplicates = $hashGroup.Group
+            
+            if ($hash -and $duplicates.Count -gt 1) {
+                $duplicateGroups[$hash] = $duplicates
+                
+                # Update inventory if requested
+                if ($UpdateInventory) {
+                    foreach ($file in $duplicates) {
+                        $file.IsDuplicate = "Yes"
+                        $file.DuplicateCount = $duplicates.Count
+                    }
+                }
+            }
+        }
+    }
+    
+    Write-Verbose "Found $($duplicateGroups.Count) groups of duplicate files"
+    
+    return $duplicateGroups
+}
+
+function Get-DuplicateFilesSummary {
+    <#
+    .SYNOPSIS
+        Generates a summary report of duplicate files
+        
+    .PARAMETER DuplicateGroups
+        Hashtable of duplicate file groups from Find-DuplicateFiles
+        
+    .OUTPUTS
+        Returns a summary object with duplicate statistics
+    #>
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$DuplicateGroups
+    )
+    
+    $totalDuplicateFiles = 0
+    $totalWastedSpace = 0
+    $duplicateSummary = [System.Collections.Generic.List[PSCustomObject]]::new()
+    
+    foreach ($hash in $DuplicateGroups.Keys) {
+        $files = $DuplicateGroups[$hash]
+        $fileCount = $files.Count
+        $fileSize = $files[0].FileSizeBytes
+        $wastedSpace = $fileSize * ($fileCount - 1)  # Space used by duplicates (keeping 1 original)
+        
+        $totalDuplicateFiles += $fileCount
+        $totalWastedSpace += $wastedSpace
+        
+        $duplicateSummary.Add([PSCustomObject]@{
+            FileHash           = $hash
+            FileName           = $files[0].FileName
+            FileExtension      = $files[0].FileExtension
+            FileSizeBytes      = $fileSize
+            FileSizeMB         = [math]::Round($fileSize / 1MB, 2)
+            FileSizeGB         = [math]::Round($fileSize / 1GB, 4)
+            DuplicateCount     = $fileCount
+            WastedSpaceBytes   = $wastedSpace
+            WastedSpaceMB      = [math]::Round($wastedSpace / 1MB, 2)
+            WastedSpaceGB      = [math]::Round($wastedSpace / 1GB, 4)
+            StorageAccounts    = ($files | Select-Object -ExpandProperty StorageAccount -Unique) -join '; '
+            FileShares         = ($files | Select-Object -ExpandProperty FileShare -Unique) -join '; '
+            Locations          = ($files | Select-Object -ExpandProperty FilePath) -join '; '
+        })
+    }
+    
+    return [PSCustomObject]@{
+        TotalDuplicateGroups = $DuplicateGroups.Count
+        TotalDuplicateFiles  = $totalDuplicateFiles
+        TotalWastedSpaceBytes = $totalWastedSpace
+        TotalWastedSpaceMB   = [math]::Round($totalWastedSpace / 1MB, 2)
+        TotalWastedSpaceGB   = [math]::Round($totalWastedSpace / 1GB, 2)
+        TotalWastedSpaceTB   = [math]::Round($totalWastedSpace / 1TB, 4)
+        DuplicateDetails     = $duplicateSummary | Sort-Object -Property WastedSpaceBytes -Descending
+        GeneratedAt          = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    }
+}
+
+function Export-DuplicateFilesReport {
+    <#
+    .SYNOPSIS
+        Exports duplicate files report to CSV
+        
+    .PARAMETER DuplicateSummary
+        Summary object from Get-DuplicateFilesSummary
+        
+    .PARAMETER OutputPath
+        Path to save the CSV file
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$DuplicateSummary,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$OutputPath
+    )
+    
+    if ($DuplicateSummary.DuplicateDetails.Count -eq 0) {
+        Write-Verbose "No duplicate files to export"
+        return
+    }
+    
+    $DuplicateSummary.DuplicateDetails | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+    Write-Verbose "Exported $($DuplicateSummary.DuplicateDetails.Count) duplicate file groups to: $OutputPath"
+}
+
 # Export functions
 Export-ModuleMember -Function @(
     'New-FileInventoryEntry',
@@ -365,5 +542,8 @@ Export-ModuleMember -Function @(
     'Get-SizeBucket',
     'Export-FileInventoryToCsv',
     'Get-FileInventorySummary',
-    'Get-DirectoryTreeData'
+    'Get-DirectoryTreeData',
+    'Find-DuplicateFiles',
+    'Get-DuplicateFilesSummary',
+    'Export-DuplicateFilesReport'
 )

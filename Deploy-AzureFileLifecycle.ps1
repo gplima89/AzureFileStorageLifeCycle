@@ -117,6 +117,21 @@ Publish-AzAutomationRunbook `
 
 Write-Host "✓ Runbook uploaded and published" -ForegroundColor Green
 
+# Link runbook to schedule
+Write-Host "  Linking runbook to schedule..." -ForegroundColor Gray
+$scheduleName = "WeeklySunday2AM"
+$configBlobUrl = "https://$ConfigStorageAccountName.blob.core.windows.net/config/lifecycle-rules.json"
+
+Register-AzAutomationScheduledRunbook `
+    -ResourceGroupName $ResourceGroupName `
+    -AutomationAccountName $AutomationAccountName `
+    -RunbookName "AzureFileStorageLifecycle" `
+    -ScheduleName $scheduleName `
+    -Parameters @{ ConfigurationPath = $configBlobUrl } `
+    -ErrorAction SilentlyContinue | Out-Null
+
+Write-Host "✓ Runbook linked to schedule" -ForegroundColor Green
+
 # Step 5: Assign permissions to audit storage account
 Write-Host "`n[5/7] Assigning permissions to audit storage account..." -ForegroundColor Yellow
 $auditStorageAccount = Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq $AuditStorageAccountName }
