@@ -11,7 +11,7 @@
 
 ```powershell
 # 1. Navigate to the project directory
-cd "C:\Users\guillima\OneDrive - Microsoft\Documents\Microsoft\Scripts\FileStorage Life Cycle\AzureFileStorageLifeCycle"
+cd "AzureFileStorageLifeCycle"
 
 # 2. Run the deployment script
 .\Deploy-AzureFileLifecycle.ps1 `
