@@ -1,0 +1,30 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "automationAccountName": {
+            "value": "aa-file-lifecycle-prod"
+        },
+        "location": {
+            "value": "eastus"
+        },
+        "runbookName": {
+            "value": "AzureFileStorageLifecycle"
+        },
+        "scheduleName": {
+            "value": "WeeklySunday2AM"
+        },
+        "scheduleStartTime": {
+            "value": "2025-12-07T02:00:00+00:00"
+        },
+        "timeZone": {
+            "value": "UTC"
+        },
+        "configurationStorageAccountName": {
+            "value": "stconfiglifecycle"
+        },
+        "configurationContainerName": {
+            "value": "config"
+        }
+    }
+}

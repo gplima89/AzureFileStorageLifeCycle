@@ -1,5 +1,5 @@
 {
-    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "$schema": "https://schema.management.azure.com/schemas/2018-05-01/subscriptionDeploymentTemplate.json#",
     "contentVersion": "1.0.0.0",
     "parameters": {
         "automationAccountPrincipalId": {
@@ -29,7 +29,7 @@
     "resources": [
         {
             "type": "Microsoft.Authorization/roleAssignments",
-            "apiVersion": "2022-04-01",
+            "apiVersion": "2017-09-01",
             "name": "[guid(subscription().subscriptionId, parameters('automationAccountPrincipalId'), variables('storageBlobDataContributorRoleId'), parameters('storageAccountNames')[copyIndex()])]",
             "copy": {
                 "name": "blobRoleAssignmentsCopy",
@@ -44,7 +44,7 @@
         },
         {
             "type": "Microsoft.Authorization/roleAssignments",
-            "apiVersion": "2022-04-01",
+            "apiVersion": "2017-09-01",
             "name": "[guid(subscription().subscriptionId, parameters('automationAccountPrincipalId'), variables('storageFileDataSmbShareContributorRoleId'), parameters('storageAccountNames')[copyIndex()])]",
             "copy": {
                 "name": "fileRoleAssignmentsCopy",

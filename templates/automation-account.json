@@ -5,7 +5,7 @@
         "automationAccountName": {
             "type": "string",
             "metadata": {
-                "description": "Name of the Automation Account"
+                "description": "AzureFilesLifeCycleLabGuil"
             }
         },
         "location": {
@@ -19,21 +19,21 @@
             "type": "string",
             "defaultValue": "AzureFileStorageLifecycle",
             "metadata": {
-                "description": "Name of the runbook"
+                "description": "FileStorage1Lifecycle"
             }
         },
         "scheduleName": {
             "type": "string",
             "defaultValue": "WeeklySunday2AM",
             "metadata": {
-                "description": "Name of the schedule"
+                "description": "Weekly schedule running every Sunday at 2:00 AM"
             }
         },
         "scheduleStartTime": {
             "type": "string",
-            "defaultValue": "[dateTimeAdd(utcNow('yyyy-MM-ddTHH:mm:ssZ'), 'P7D')]",
+            "defaultValue": "2025-12-07T02:00:00Z",
             "metadata": {
-                "description": "Start time for the schedule (next Sunday 2AM)"
+                "description": "Start time for the schedule (RFC3339 format). Default: Next Sunday at 2:00 AM UTC"
             }
         },
         "timeZone": {
@@ -64,7 +64,7 @@
     "resources": [
         {
             "type": "Microsoft.Automation/automationAccounts",
-            "apiVersion": "2022-08-08",
+            "apiVersion": "2020-01-13-preview",
             "name": "[parameters('automationAccountName')]",
             "location": "[parameters('location')]",
             "identity": {
@@ -79,7 +79,7 @@
         },
         {
             "type": "Microsoft.Automation/automationAccounts/modules",
-            "apiVersion": "2022-08-08",
+            "apiVersion": "2015-10-31",
             "name": "[concat(parameters('automationAccountName'), '/Az.Accounts')]",
             "dependsOn": [
                 "[resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName'))]"
@@ -92,7 +92,7 @@
         },
         {
             "type": "Microsoft.Automation/automationAccounts/modules",
-            "apiVersion": "2022-08-08",
+            "apiVersion": "2015-10-31",
             "name": "[concat(parameters('automationAccountName'), '/Az.Storage')]",
             "dependsOn": [
                 "[resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName'))]",
@@ -106,7 +106,7 @@
         },
         {
             "type": "Microsoft.Automation/automationAccounts/runbooks",
-            "apiVersion": "2022-08-08",
+            "apiVersion": "2015-10-31",
             "name": "[concat(parameters('automationAccountName'), '/', parameters('runbookName'))]",
             "location": "[parameters('location')]",
             "dependsOn": [
@@ -123,7 +123,7 @@
         },
         {
             "type": "Microsoft.Automation/automationAccounts/schedules",
-            "apiVersion": "2022-08-08",
+            "apiVersion": "2015-10-31",
             "name": "[concat(parameters('automationAccountName'), '/', parameters('scheduleName'))]",
             "dependsOn": [
                 "[resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName'))]"
@@ -131,8 +131,7 @@
             "properties": {
                 "description": "[variables('scheduleDescription')]",
                 "startTime": "[parameters('scheduleStartTime')]",
-                "expiryTime": "9999-12-31T23:59:59.9999999+00:00",
-                "interval": 1,
+                "expiryTime": "9999-12-31T23:59:59+00:00",
                 "frequency": "Week",
                 "timeZone": "[parameters('timeZone')]",
                 "advancedSchedule": {
@@ -144,7 +143,7 @@
         },
         {
             "type": "Microsoft.Automation/automationAccounts/jobSchedules",
-            "apiVersion": "2022-08-08",
+            "apiVersion": "2015-10-31",
             "name": "[concat(parameters('automationAccountName'), '/', guid(parameters('runbookName'), parameters('scheduleName')))]",
             "dependsOn": [
                 "[resourceId('Microsoft.Automation/automationAccounts/runbooks', parameters('automationAccountName'), parameters('runbookName'))]",
@@ -164,7 +163,7 @@
         },
         {
             "type": "Microsoft.Automation/automationAccounts/variables",
-            "apiVersion": "2022-08-08",
+            "apiVersion": "2015-10-31",
             "name": "[concat(parameters('automationAccountName'), '/ConfigurationPath')]",
             "dependsOn": [
                 "[resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName'))]"
@@ -183,7 +182,7 @@
         },
         "automationAccountPrincipalId": {
             "type": "string",
-            "value": "[reference(resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName')), '2022-08-08', 'Full').identity.principalId]"
+            "value": "[reference(resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName')), '2020-01-13-preview', 'Full').identity.principalId]"
         },
         "runbookName": {
             "type": "string",

@@ -128,13 +128,29 @@ function Get-LifecycleConfiguration {
     
     Write-Log "Loading configuration from: $ConfigPath" -Level Information
     
-    if (-not (Test-Path $ConfigPath)) {
-        throw "Configuration file not found: $ConfigPath"
-    }
-    
     try {
-        $configContent = Get-Content -Path $ConfigPath -Raw
-        $config = $configContent | ConvertFrom-Json
+        # Check if ConfigPath is a URL (blob storage)
+        if ($ConfigPath -match '^https?://') {
+            Write-Log "Configuration is a URL, downloading from: $ConfigPath" -Level Information
+            $configContent = Invoke-RestMethod -Uri $ConfigPath -Method Get -ErrorAction Stop
+            
+            # Convert to JSON if it's not already
+            if ($configContent -is [string]) {
+                $config = $configContent | ConvertFrom-Json
+            }
+            else {
+                $config = $configContent
+            }
+        }
+        else {
+            # Local file path
+            if (-not (Test-Path $ConfigPath)) {
+                throw "Configuration file not found: $ConfigPath"
+            }
+            
+            $configContent = Get-Content -Path $ConfigPath -Raw
+            $config = $configContent | ConvertFrom-Json
+        }
         
         # Validate required properties
         if (-not $config.version) {
