@@ -1,0 +1,202 @@
+{
+    "name": "AzureFileStorageAnalysis",
+    "description": "Power BI data model definition for Azure File Storage Analysis Dashboard",
+    "version": "1.0.0",
+    "tables": [
+        {
+            "name": "FileInventory",
+            "description": "File inventory data from Azure File Storage scan",
+            "columns": [
+                {"name": "StorageAccount", "dataType": "string", "description": "Storage account name"},
+                {"name": "FileShare", "dataType": "string", "description": "File share name"},
+                {"name": "Directory", "dataType": "string", "description": "Parent directory path"},
+                {"name": "FilePath", "dataType": "string", "description": "Full file path"},
+                {"name": "FileName", "dataType": "string", "description": "File name only"},
+                {"name": "FileExtension", "dataType": "string", "description": "File extension"},
+                {"name": "FileCategory", "dataType": "string", "description": "File category"},
+                {"name": "FileSizeBytes", "dataType": "int64", "description": "Size in bytes"},
+                {"name": "FileSizeKB", "dataType": "double", "description": "Size in KB"},
+                {"name": "FileSizeMB", "dataType": "double", "description": "Size in MB"},
+                {"name": "FileSizeGB", "dataType": "double", "description": "Size in GB"},
+                {"name": "FileSizeTB", "dataType": "double", "description": "Size in TB"},
+                {"name": "LastModified", "dataType": "datetime", "description": "Last modification timestamp"},
+                {"name": "LastModifiedDate", "dataType": "date", "description": "Last modification date only"},
+                {"name": "Created", "dataType": "datetime", "description": "Creation timestamp"},
+                {"name": "CreatedDate", "dataType": "date", "description": "Creation date only"},
+                {"name": "AgeInDays", "dataType": "int64", "description": "Days since last modification"},
+                {"name": "AgeBucket", "dataType": "string", "description": "Age range category"},
+                {"name": "SizeBucket", "dataType": "string", "description": "Size range category"},
+                {"name": "ScanTimestamp", "dataType": "datetime", "description": "Scan timestamp"},
+                {"name": "SizeRank", "dataType": "int64", "description": "Rank by file size (1 = largest)"}
+            ],
+            "source": {
+                "type": "AzureBlobStorage",
+                "container": "file-inventory",
+                "file": "file-inventory_latest.csv"
+            }
+        },
+        {
+            "name": "AuditLog",
+            "description": "Audit log of lifecycle operations",
+            "columns": [
+                {"name": "Timestamp", "dataType": "datetime", "description": "Operation timestamp"},
+                {"name": "StorageAccount", "dataType": "string", "description": "Storage account name"},
+                {"name": "FileShare", "dataType": "string", "description": "File share name"},
+                {"name": "FilePath", "dataType": "string", "description": "Full file path"},
+                {"name": "FileName", "dataType": "string", "description": "File name"},
+                {"name": "FileExtension", "dataType": "string", "description": "File extension"},
+                {"name": "Action", "dataType": "string", "description": "Action performed"},
+                {"name": "RuleName", "dataType": "string", "description": "Rule that triggered the action"},
+                {"name": "FileSizeBytes", "dataType": "int64", "description": "File size in bytes"},
+                {"name": "FileSizeMB", "dataType": "double", "description": "File size in MB"},
+                {"name": "Status", "dataType": "string", "description": "Operation status"},
+                {"name": "ErrorMessage", "dataType": "string", "description": "Error message if failed"},
+                {"name": "DryRun", "dataType": "boolean", "description": "Whether this was a dry run"}
+            ],
+            "source": {
+                "type": "AzureBlobStorage",
+                "container": "audit-logs",
+                "pattern": "audit-log_*.csv"
+            }
+        },
+        {
+            "name": "DateDimension",
+            "description": "Date dimension table for time-based analysis",
+            "columns": [
+                {"name": "Date", "dataType": "date"},
+                {"name": "Year", "dataType": "int64"},
+                {"name": "Quarter", "dataType": "int64"},
+                {"name": "Month", "dataType": "int64"},
+                {"name": "MonthName", "dataType": "string"},
+                {"name": "Week", "dataType": "int64"},
+                {"name": "DayOfWeek", "dataType": "int64"},
+                {"name": "DayName", "dataType": "string"},
+                {"name": "IsWeekend", "dataType": "boolean"}
+            ],
+            "source": {
+                "type": "Calculated",
+                "generator": "DateRange(2020-01-01, 2030-12-31)"
+            }
+        }
+    ],
+    "relationships": [
+        {
+            "from": {"table": "FileInventory", "column": "LastModifiedDate"},
+            "to": {"table": "DateDimension", "column": "Date"},
+            "cardinality": "many-to-one"
+        },
+        {
+            "from": {"table": "AuditLog", "column": "Timestamp"},
+            "to": {"table": "DateDimension", "column": "Date"},
+            "cardinality": "many-to-one"
+        }
+    ],
+    "measures": [
+        {
+            "name": "Total Size (GB)",
+            "table": "FileInventory",
+            "expression": "SUM('FileInventory'[FileSizeGB])",
+            "formatString": "#,##0.00"
+        },
+        {
+            "name": "Total Size (TB)",
+            "table": "FileInventory",
+            "expression": "SUM('FileInventory'[FileSizeTB])",
+            "formatString": "#,##0.0000"
+        },
+        {
+            "name": "Total Files",
+            "table": "FileInventory",
+            "expression": "COUNTROWS('FileInventory')",
+            "formatString": "#,##0"
+        },
+        {
+            "name": "Avg File Size (MB)",
+            "table": "FileInventory",
+            "expression": "AVERAGE('FileInventory'[FileSizeMB])",
+            "formatString": "#,##0.00"
+        },
+        {
+            "name": "Largest File (GB)",
+            "table": "FileInventory",
+            "expression": "MAX('FileInventory'[FileSizeGB])",
+            "formatString": "#,##0.00"
+        },
+        {
+            "name": "Files Over 1GB",
+            "table": "FileInventory",
+            "expression": "CALCULATE(COUNTROWS('FileInventory'), 'FileInventory'[FileSizeGB] >= 1)",
+            "formatString": "#,##0"
+        },
+        {
+            "name": "Old Files (>1 year)",
+            "table": "FileInventory",
+            "expression": "CALCULATE(COUNTROWS('FileInventory'), 'FileInventory'[AgeInDays] > 365)",
+            "formatString": "#,##0"
+        },
+        {
+            "name": "Total Deleted (GB)",
+            "table": "AuditLog",
+            "expression": "CALCULATE(SUM('AuditLog'[FileSizeMB]) / 1024, 'AuditLog'[Action] = \"delete\", 'AuditLog'[Status] = \"Success\")",
+            "formatString": "#,##0.00"
+        },
+        {
+            "name": "Total Moved (GB)",
+            "table": "AuditLog",
+            "expression": "CALCULATE(SUM('AuditLog'[FileSizeMB]) / 1024, OR('AuditLog'[Action] = \"moveToCool\", 'AuditLog'[Action] = \"moveToArchive\"), 'AuditLog'[Status] = \"Success\")",
+            "formatString": "#,##0.00"
+        },
+        {
+            "name": "Success Rate %",
+            "table": "AuditLog",
+            "expression": "DIVIDE(CALCULATE(COUNTROWS('AuditLog'), 'AuditLog'[Status] = \"Success\"), COUNTROWS('AuditLog')) * 100",
+            "formatString": "#,##0.0%"
+        }
+    ],
+    "visualizations": [
+        {
+            "name": "StorageTreemap",
+            "type": "treemap",
+            "description": "Hierarchical storage consumption view",
+            "group": ["StorageAccount", "FileShare", "Directory"],
+            "values": ["Total Size (GB)"]
+        },
+        {
+            "name": "TopFilesTable",
+            "type": "table",
+            "description": "Top largest files",
+            "columns": ["FileName", "FilePath", "FileSizeGB", "FileCategory", "LastModified", "StorageAccount"],
+            "topN": 100,
+            "sortBy": "FileSizeGB",
+            "sortOrder": "descending"
+        },
+        {
+            "name": "SizeDistribution",
+            "type": "barChart",
+            "description": "File size distribution",
+            "axis": "SizeBucket",
+            "values": ["Total Files"]
+        },
+        {
+            "name": "AgeDistribution",
+            "type": "pieChart",
+            "description": "File age distribution",
+            "legend": "AgeBucket",
+            "values": ["Total Size (GB)"]
+        },
+        {
+            "name": "CategoryBreakdown",
+            "type": "donutChart",
+            "description": "Storage by file category",
+            "legend": "FileCategory",
+            "values": ["Total Size (GB)"]
+        },
+        {
+            "name": "ActionsSummary",
+            "type": "barChart",
+            "description": "Lifecycle actions summary",
+            "axis": "Action",
+            "values": ["Count", "Total Size (GB)"]
+        }
+    ]
+}

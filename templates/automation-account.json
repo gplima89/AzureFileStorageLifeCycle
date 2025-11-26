@@ -1,0 +1,197 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "automationAccountName": {
+            "type": "string",
+            "metadata": {
+                "description": "Name of the Automation Account"
+            }
+        },
+        "location": {
+            "type": "string",
+            "defaultValue": "[resourceGroup().location]",
+            "metadata": {
+                "description": "Location for the Automation Account"
+            }
+        },
+        "runbookName": {
+            "type": "string",
+            "defaultValue": "AzureFileStorageLifecycle",
+            "metadata": {
+                "description": "Name of the runbook"
+            }
+        },
+        "scheduleName": {
+            "type": "string",
+            "defaultValue": "WeeklySunday2AM",
+            "metadata": {
+                "description": "Name of the schedule"
+            }
+        },
+        "scheduleStartTime": {
+            "type": "string",
+            "defaultValue": "[dateTimeAdd(utcNow('yyyy-MM-ddTHH:mm:ssZ'), 'P7D')]",
+            "metadata": {
+                "description": "Start time for the schedule (next Sunday 2AM)"
+            }
+        },
+        "timeZone": {
+            "type": "string",
+            "defaultValue": "UTC",
+            "metadata": {
+                "description": "Time zone for the schedule"
+            }
+        },
+        "configurationStorageAccountName": {
+            "type": "string",
+            "metadata": {
+                "description": "Storage account containing the configuration file"
+            }
+        },
+        "configurationContainerName": {
+            "type": "string",
+            "defaultValue": "config",
+            "metadata": {
+                "description": "Container name for configuration files"
+            }
+        }
+    },
+    "variables": {
+        "scheduleDescription": "Weekly schedule running every Sunday at 2:00 AM",
+        "runbookDescription": "Azure File Storage Lifecycle Management - Implements lifecycle rules for Azure SMB file storage including delete and tier movement operations"
+    },
+    "resources": [
+        {
+            "type": "Microsoft.Automation/automationAccounts",
+            "apiVersion": "2022-08-08",
+            "name": "[parameters('automationAccountName')]",
+            "location": "[parameters('location')]",
+            "identity": {
+                "type": "SystemAssigned"
+            },
+            "properties": {
+                "sku": {
+                    "name": "Basic"
+                },
+                "publicNetworkAccess": true
+            }
+        },
+        {
+            "type": "Microsoft.Automation/automationAccounts/modules",
+            "apiVersion": "2022-08-08",
+            "name": "[concat(parameters('automationAccountName'), '/Az.Accounts')]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName'))]"
+            ],
+            "properties": {
+                "contentLink": {
+                    "uri": "https://www.powershellgallery.com/api/v2/package/Az.Accounts"
+                }
+            }
+        },
+        {
+            "type": "Microsoft.Automation/automationAccounts/modules",
+            "apiVersion": "2022-08-08",
+            "name": "[concat(parameters('automationAccountName'), '/Az.Storage')]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName'))]",
+                "[resourceId('Microsoft.Automation/automationAccounts/modules', parameters('automationAccountName'), 'Az.Accounts')]"
+            ],
+            "properties": {
+                "contentLink": {
+                    "uri": "https://www.powershellgallery.com/api/v2/package/Az.Storage"
+                }
+            }
+        },
+        {
+            "type": "Microsoft.Automation/automationAccounts/runbooks",
+            "apiVersion": "2022-08-08",
+            "name": "[concat(parameters('automationAccountName'), '/', parameters('runbookName'))]",
+            "location": "[parameters('location')]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName'))]",
+                "[resourceId('Microsoft.Automation/automationAccounts/modules', parameters('automationAccountName'), 'Az.Storage')]"
+            ],
+            "properties": {
+                "runbookType": "PowerShell",
+                "logVerbose": true,
+                "logProgress": true,
+                "logActivityTrace": 1,
+                "description": "[variables('runbookDescription')]"
+            }
+        },
+        {
+            "type": "Microsoft.Automation/automationAccounts/schedules",
+            "apiVersion": "2022-08-08",
+            "name": "[concat(parameters('automationAccountName'), '/', parameters('scheduleName'))]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName'))]"
+            ],
+            "properties": {
+                "description": "[variables('scheduleDescription')]",
+                "startTime": "[parameters('scheduleStartTime')]",
+                "expiryTime": "9999-12-31T23:59:59.9999999+00:00",
+                "interval": 1,
+                "frequency": "Week",
+                "timeZone": "[parameters('timeZone')]",
+                "advancedSchedule": {
+                    "weekDays": [
+                        "Sunday"
+                    ]
+                }
+            }
+        },
+        {
+            "type": "Microsoft.Automation/automationAccounts/jobSchedules",
+            "apiVersion": "2022-08-08",
+            "name": "[concat(parameters('automationAccountName'), '/', guid(parameters('runbookName'), parameters('scheduleName')))]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Automation/automationAccounts/runbooks', parameters('automationAccountName'), parameters('runbookName'))]",
+                "[resourceId('Microsoft.Automation/automationAccounts/schedules', parameters('automationAccountName'), parameters('scheduleName'))]"
+            ],
+            "properties": {
+                "schedule": {
+                    "name": "[parameters('scheduleName')]"
+                },
+                "runbook": {
+                    "name": "[parameters('runbookName')]"
+                },
+                "parameters": {
+                    "ConfigurationPath": "[concat('https://', parameters('configurationStorageAccountName'), '.blob.core.windows.net/', parameters('configurationContainerName'), '/lifecycle-rules.json')]"
+                }
+            }
+        },
+        {
+            "type": "Microsoft.Automation/automationAccounts/variables",
+            "apiVersion": "2022-08-08",
+            "name": "[concat(parameters('automationAccountName'), '/ConfigurationPath')]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName'))]"
+            ],
+            "properties": {
+                "description": "Path to the lifecycle rules configuration file",
+                "value": "[concat('\"https://', parameters('configurationStorageAccountName'), '.blob.core.windows.net/', parameters('configurationContainerName'), '/lifecycle-rules.json\"')]",
+                "isEncrypted": false
+            }
+        }
+    ],
+    "outputs": {
+        "automationAccountName": {
+            "type": "string",
+            "value": "[parameters('automationAccountName')]"
+        },
+        "automationAccountPrincipalId": {
+            "type": "string",
+            "value": "[reference(resourceId('Microsoft.Automation/automationAccounts', parameters('automationAccountName')), '2022-08-08', 'Full').identity.principalId]"
+        },
+        "runbookName": {
+            "type": "string",
+            "value": "[parameters('runbookName')]"
+        },
+        "scheduleName": {
+            "type": "string",
+            "value": "[parameters('scheduleName')]"
+        }
+    }
+}

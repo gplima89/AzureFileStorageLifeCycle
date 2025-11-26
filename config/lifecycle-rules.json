@@ -1,0 +1,103 @@
+{
+    "$schema": "./lifecycle-rules-schema.json",
+    "description": "Azure File Storage Lifecycle Management Configuration",
+    "version": "1.0.0",
+    "globalSettings": {
+        "dryRun": false,
+        "logLevel": "Information",
+        "auditLogStorageAccount": "yourstorageaccount",
+        "auditLogContainer": "audit-logs",
+        "fileInventoryContainer": "file-inventory",
+        "retainAuditLogsDays": 90,
+        "maxParallelOperations": 10,
+        "excludePatterns": [
+            "*.tmp",
+            "~$*",
+            ".DS_Store",
+            "Thumbs.db"
+        ]
+    },
+    "storageAccounts": [
+        {
+            "name": "storageaccount1",
+            "resourceGroup": "rg-storage-prod",
+            "subscriptionId": "00000000-0000-0000-0000-000000000000",
+            "enabled": true,
+            "fileShares": [
+                {
+                    "name": "fileshare1",
+                    "enabled": true,
+                    "rules": [
+                        {
+                            "name": "DeleteOldTempFiles",
+                            "enabled": true,
+                            "action": "delete",
+                            "conditions": {
+                                "lastModifiedDaysAgo": 30,
+                                "pathPrefix": "temp/",
+                                "fileExtensions": [".tmp", ".bak", ".log"]
+                            }
+                        },
+                        {
+                            "name": "MoveToCoolAfter90Days",
+                            "enabled": true,
+                            "action": "moveToCool",
+                            "conditions": {
+                                "lastModifiedDaysAgo": 90,
+                                "pathPrefix": "documents/",
+                                "minSizeBytes": 1048576
+                            }
+                        },
+                        {
+                            "name": "MoveToArchiveAfter365Days",
+                            "enabled": true,
+                            "action": "moveToArchive",
+                            "conditions": {
+                                "lastModifiedDaysAgo": 365,
+                                "pathPrefix": "archive/",
+                                "fileExtensions": [".pdf", ".docx", ".xlsx"]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "name": "fileshare2",
+                    "enabled": true,
+                    "rules": [
+                        {
+                            "name": "DeleteVeryOldFiles",
+                            "enabled": true,
+                            "action": "delete",
+                            "conditions": {
+                                "lastModifiedDaysAgo": 730
+                            }
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "storageaccount2",
+            "resourceGroup": "rg-storage-dev",
+            "subscriptionId": "00000000-0000-0000-0000-000000000001",
+            "enabled": false,
+            "fileShares": [
+                {
+                    "name": "devshare",
+                    "enabled": true,
+                    "rules": [
+                        {
+                            "name": "CleanupOldBuilds",
+                            "enabled": true,
+                            "action": "delete",
+                            "conditions": {
+                                "lastModifiedDaysAgo": 14,
+                                "pathPrefix": "builds/"
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}
