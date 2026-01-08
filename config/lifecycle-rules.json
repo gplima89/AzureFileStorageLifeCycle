@@ -15,7 +15,14 @@
             "~$*",
             ".DS_Store",
             "Thumbs.db"
-        ]
+        ],
+        "logAnalytics": {
+            "enabled": false,
+            "dceEndpoint": "",
+            "dcrImmutableId": "",
+            "streamName": "",
+            "tableName": ""
+        }
     },
     "storageAccounts": [
         {

@@ -20,6 +20,21 @@
     
 .PARAMETER DryRun
     If specified, no actual changes are made, only logged
+    
+.PARAMETER SendToLogAnalytics
+    If specified, sends file inventory data to Azure Log Analytics
+    
+.PARAMETER LogAnalyticsDceEndpoint
+    Data Collection Endpoint URI for Log Analytics ingestion
+    
+.PARAMETER LogAnalyticsDcrImmutableId
+    Data Collection Rule immutable ID for Log Analytics ingestion
+    
+.PARAMETER LogAnalyticsStreamName
+    Stream name defined in the DCR (e.g., Custom-TableName_CL)
+    
+.PARAMETER LogAnalyticsTableName
+    Target table name in Log Analytics (e.g., StgFileLifeCycle01_CL)
 #>
 
 [CmdletBinding()]
@@ -28,7 +43,22 @@ param(
     [string]$ConfigurationPath = ".\config\lifecycle-rules.json",
     
     [Parameter(Mandatory = $false)]
-    [switch]$DryRun
+    [switch]$DryRun,
+    
+    [Parameter(Mandatory = $false)]
+    [switch]$SendToLogAnalytics,
+    
+    [Parameter(Mandatory = $false)]
+    [string]$LogAnalyticsDceEndpoint = "",
+    
+    [Parameter(Mandatory = $false)]
+    [string]$LogAnalyticsDcrImmutableId = "",
+    
+    [Parameter(Mandatory = $false)]
+    [string]$LogAnalyticsStreamName = "",
+    
+    [Parameter(Mandatory = $false)]
+    [string]$LogAnalyticsTableName = ""
 )
 
 #region Module Imports
@@ -43,12 +73,37 @@ catch {
     Write-Error "Failed to import required Az modules: $_"
     throw
 }
+
+# Import Log Analytics module if sending is enabled
+if ($SendToLogAnalytics) {
+    try {
+        # Try to import from same directory as runbook
+        $scriptPath = $PSScriptRoot
+        if (-not $scriptPath) { $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path }
+        $modulePath = Join-Path (Split-Path -Parent $scriptPath) "modules\LogAnalyticsIngestion.psm1"
+        
+        if (Test-Path $modulePath) {
+            Import-Module $modulePath -ErrorAction Stop
+        }
+        else {
+            # Try from Automation Account modules
+            Import-Module LogAnalyticsIngestion -ErrorAction Stop
+        }
+        Write-Output "LogAnalyticsIngestion module loaded successfully"
+    }
+    catch {
+        Write-Warning "Failed to import LogAnalyticsIngestion module: $_"
+        Write-Warning "Log Analytics integration will be skipped"
+        $SendToLogAnalytics = $false
+    }
+}
 #endregion
 
 #region Global Variables
 $script:AuditLog = [System.Collections.Generic.List[PSCustomObject]]::new()
 $script:FileInventory = [System.Collections.Generic.List[PSCustomObject]]::new()
 $script:ExecutionStartTime = Get-Date
+$script:ExecutionId = [guid]::NewGuid().ToString()
 $script:TotalFilesProcessed = 0
 $script:TotalFilesDeleted = 0
 $script:TotalFilesMoved = 0
@@ -1121,6 +1176,117 @@ try {
         if ($script:FileInventory.Count -gt 0) {
             $script:FileInventory | Sort-Object -Property FileSizeBytes -Descending | Export-Csv -Path $localInventoryPath -NoTypeInformation -Encoding UTF8
             Write-Log "File inventory exported locally: $localInventoryPath" -Level Information
+        }
+    }
+    
+    # Send file inventory to Log Analytics if enabled
+    if ($SendToLogAnalytics -and $script:FileInventory.Count -gt 0) {
+        Write-Log "Sending file inventory to Log Analytics..." -Level Information
+        
+        try {
+            # Get Log Analytics settings from config or parameters
+            $dceEndpoint = if ($LogAnalyticsDceEndpoint) { $LogAnalyticsDceEndpoint } 
+                           elseif ($config.globalSettings.logAnalytics.dceEndpoint) { $config.globalSettings.logAnalytics.dceEndpoint }
+                           else { "" }
+            
+            $dcrImmutableId = if ($LogAnalyticsDcrImmutableId) { $LogAnalyticsDcrImmutableId }
+                              elseif ($config.globalSettings.logAnalytics.dcrImmutableId) { $config.globalSettings.logAnalytics.dcrImmutableId }
+                              else { "" }
+            
+            $streamName = if ($LogAnalyticsStreamName) { $LogAnalyticsStreamName }
+                          elseif ($config.globalSettings.logAnalytics.streamName) { $config.globalSettings.logAnalytics.streamName }
+                          else { "" }
+            
+            $tableName = if ($LogAnalyticsTableName) { $LogAnalyticsTableName }
+                         elseif ($config.globalSettings.logAnalytics.tableName) { $config.globalSettings.logAnalytics.tableName }
+                         else { "" }
+            
+            if (-not $dceEndpoint -or -not $dcrImmutableId -or -not $streamName -or -not $tableName) {
+                Write-Log "Log Analytics configuration incomplete. Required: DCE Endpoint, DCR Immutable ID, Stream Name, Table Name" -Level Warning
+            }
+            else {
+                # Initialize Log Analytics ingestion
+                Initialize-LogAnalyticsIngestion `
+                    -DceEndpoint $dceEndpoint `
+                    -DcrImmutableId $dcrImmutableId `
+                    -StreamName $streamName `
+                    -TableName $tableName `
+                    -BatchSize 500
+                
+                # Prepare enriched inventory data with additional fields for Log Analytics
+                $enrichedInventory = $script:FileInventory | ForEach-Object {
+                    $item = $_
+                    
+                    # Add additional categorization fields if not present
+                    if (-not $item.PSObject.Properties['FileCategory']) {
+                        $extension = $item.FileExtension.ToLower()
+                        $category = switch -Regex ($extension) {
+                            '\.(doc|docx|pdf|txt|rtf|odt|xls|xlsx|ppt|pptx|csv)$' { "Documents" }
+                            '\.(jpg|jpeg|png|gif|bmp|tiff|svg|ico|webp|raw)$' { "Images" }
+                            '\.(mp4|avi|mkv|mov|wmv|flv|webm|m4v)$' { "Videos" }
+                            '\.(mp3|wav|flac|aac|ogg|wma|m4a)$' { "Audio" }
+                            '\.(zip|rar|7z|tar|gz|bz2|xz)$' { "Archives" }
+                            '\.(cs|js|ts|py|java|cpp|h|ps1|psm1|sh|json|xml|yaml|yml)$' { "Code" }
+                            '\.(exe|dll|msi|bat|cmd|com)$' { "Executables" }
+                            '\.(sql|mdf|ldf|bak|db|sqlite)$' { "Databases" }
+                            '\.(log|evt|evtx)$' { "Logs" }
+                            '\.(tmp|temp|bak|swp|cache)$' { "Temporary" }
+                            default { "Other" }
+                        }
+                        $item | Add-Member -NotePropertyName "FileCategory" -NotePropertyValue $category -Force
+                    }
+                    
+                    # Add age bucket if not present
+                    if (-not $item.PSObject.Properties['AgeBucket'] -and $item.AgeInDays) {
+                        $ageBucket = switch ($item.AgeInDays) {
+                            { $_ -le 7 }    { "0-7 days" }
+                            { $_ -le 30 }   { "8-30 days" }
+                            { $_ -le 90 }   { "31-90 days" }
+                            { $_ -le 180 }  { "91-180 days" }
+                            { $_ -le 365 }  { "181-365 days" }
+                            { $_ -le 730 }  { "1-2 years" }
+                            { $_ -le 1825 } { "2-5 years" }
+                            default         { "5+ years" }
+                        }
+                        $item | Add-Member -NotePropertyName "AgeBucket" -NotePropertyValue $ageBucket -Force
+                    }
+                    
+                    # Add size bucket if not present
+                    if (-not $item.PSObject.Properties['SizeBucket']) {
+                        $sizeBucket = switch ($true) {
+                            { $item.FileSizeBytes -lt 1KB }     { "< 1 KB" }
+                            { $item.FileSizeBytes -lt 1MB }     { "1 KB - 1 MB" }
+                            { $item.FileSizeMB -lt 10 }         { "1 MB - 10 MB" }
+                            { $item.FileSizeMB -lt 100 }        { "10 MB - 100 MB" }
+                            { $item.FileSizeMB -lt 500 }        { "100 MB - 500 MB" }
+                            { $item.FileSizeGB -lt 1 }          { "500 MB - 1 GB" }
+                            { $item.FileSizeGB -lt 5 }          { "1 GB - 5 GB" }
+                            { $item.FileSizeGB -lt 10 }         { "5 GB - 10 GB" }
+                            default                              { "10+ GB" }
+                        }
+                        $item | Add-Member -NotePropertyName "SizeBucket" -NotePropertyValue $sizeBucket -Force
+                    }
+                    
+                    $item
+                }
+                
+                # Send to Log Analytics
+                $laResult = $enrichedInventory | Send-FileInventoryToLogAnalytics `
+                    -IncludeExecutionMetadata `
+                    -ExecutionId $script:ExecutionId
+                
+                if ($laResult.Success) {
+                    Write-Log "Successfully sent $($laResult.RecordsSent) file inventory records to Log Analytics table '$tableName'" -Level Information
+                    Write-Log "  Duration: $($laResult.DurationSeconds) seconds, Batches: $($laResult.BatchesSent)/$($laResult.TotalBatches)" -Level Information
+                }
+                else {
+                    Write-Log "Failed to send some records to Log Analytics: $($laResult.Message)" -Level Warning
+                }
+            }
+        }
+        catch {
+            Write-Log "Error sending data to Log Analytics: $_" -Level Error
+            # Don't fail the entire runbook if Log Analytics fails
         }
     }
     

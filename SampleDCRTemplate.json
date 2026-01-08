@@ -1,0 +1,121 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "metadata": {
+        "description": "Sample DCR (Data Collection Rule) template for Azure File Storage Lifecycle file inventory data"
+    },
+    "parameters": {
+        "dcrName": {
+            "type": "string",
+            "defaultValue": "dcr-stgfilelifecycle",
+            "metadata": {
+                "description": "Name of the Data Collection Rule"
+            }
+        },
+        "location": {
+            "type": "string",
+            "defaultValue": "[resourceGroup().location]",
+            "metadata": {
+                "description": "Location for the DCR"
+            }
+        },
+        "dceResourceId": {
+            "type": "string",
+            "metadata": {
+                "description": "Resource ID of the Data Collection Endpoint"
+            }
+        },
+        "workspaceResourceId": {
+            "type": "string",
+            "metadata": {
+                "description": "Resource ID of the Log Analytics Workspace"
+            }
+        },
+        "tableName": {
+            "type": "string",
+            "defaultValue": "StgFileLifeCycle01_CL",
+            "metadata": {
+                "description": "Name of the custom table in Log Analytics"
+            }
+        }
+    },
+    "resources": [
+        {
+            "type": "Microsoft.Insights/dataCollectionRules",
+            "apiVersion": "2022-06-01",
+            "name": "[parameters('dcrName')]",
+            "location": "[parameters('location')]",
+            "properties": {
+                "dataCollectionEndpointId": "[parameters('dceResourceId')]",
+                "streamDeclarations": {
+                    "[concat('Custom-', parameters('tableName'))]": {
+                        "columns": [
+                            { "name": "TimeGenerated", "type": "datetime" },
+                            { "name": "StorageAccount", "type": "string" },
+                            { "name": "FileShare", "type": "string" },
+                            { "name": "Directory", "type": "string" },
+                            { "name": "FilePath", "type": "string" },
+                            { "name": "FileName", "type": "string" },
+                            { "name": "FileExtension", "type": "string" },
+                            { "name": "FileCategory", "type": "string" },
+                            { "name": "FileSizeBytes", "type": "long" },
+                            { "name": "FileSizeKB", "type": "real" },
+                            { "name": "FileSizeMB", "type": "real" },
+                            { "name": "FileSizeGB", "type": "real" },
+                            { "name": "FileSizeTB", "type": "real" },
+                            { "name": "LastModified", "type": "datetime" },
+                            { "name": "LastModifiedDate", "type": "string" },
+                            { "name": "Created", "type": "datetime" },
+                            { "name": "CreatedDate", "type": "string" },
+                            { "name": "AgeInDays", "type": "int" },
+                            { "name": "AgeBucket", "type": "string" },
+                            { "name": "SizeBucket", "type": "string" },
+                            { "name": "ContentType", "type": "string" },
+                            { "name": "FileHash", "type": "string" },
+                            { "name": "IsDuplicate", "type": "string" },
+                            { "name": "DuplicateCount", "type": "int" },
+                            { "name": "ScanTimestamp", "type": "string" },
+                            { "name": "ScanTimestampUTC", "type": "string" },
+                            { "name": "ExecutionId", "type": "string" },
+                            { "name": "ExecutionHost", "type": "string" }
+                        ]
+                    }
+                },
+                "destinations": {
+                    "logAnalytics": [
+                        {
+                            "workspaceResourceId": "[parameters('workspaceResourceId')]",
+                            "name": "logAnalyticsDestination"
+                        }
+                    ]
+                },
+                "dataFlows": [
+                    {
+                        "streams": [
+                            "[concat('Custom-', parameters('tableName'))]"
+                        ],
+                        "destinations": [
+                            "logAnalyticsDestination"
+                        ],
+                        "transformKql": "source",
+                        "outputStream": "[concat('Custom-', parameters('tableName'))]"
+                    }
+                ]
+            }
+        }
+    ],
+    "outputs": {
+        "dcrId": {
+            "type": "string",
+            "value": "[resourceId('Microsoft.Insights/dataCollectionRules', parameters('dcrName'))]"
+        },
+        "dcrImmutableId": {
+            "type": "string",
+            "value": "[reference(resourceId('Microsoft.Insights/dataCollectionRules', parameters('dcrName'))).immutableId]"
+        },
+        "streamName": {
+            "type": "string",
+            "value": "[concat('Custom-', parameters('tableName'))]"
+        }
+    }
+}
