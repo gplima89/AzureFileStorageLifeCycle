@@ -10,6 +10,8 @@ A PowerShell solution to implement lifecycle management rules for Azure SMB File
 - **Scheduled Execution**: Weekly runs on Sundays at 2:00 AM (configurable)
 - **Audit Logging**: CSV-based audit logs for all delete and move operations
 - **File Inventory**: Generate CSV reports of all files sorted by size, stored in Blob storage
+- **Log Analytics Integration**: Stream file inventory to Azure Log Analytics using DCR/DCE with Logs Ingestion API
+- **Automation Variables**: Configure settings via Automation Account variables for scheduler compatibility
 - **Power BI Dashboard**: Visualize storage consumption with TreeSize-like treemap views
 
 ## Quick Start
@@ -197,12 +199,18 @@ The Automation Account managed identity needs these roles:
 | Role | Scope | Purpose |
 |------|-------|---------|
 | Storage Blob Data Contributor | Audit storage account | Write audit logs and inventory |
+| Storage Blob Data Reader | Config storage account | Read configuration file |
 | Storage File Data SMB Share Contributor | Managed storage accounts | Read/write/delete files |
+| Storage File Data SMB Share Reader | Managed storage accounts | Read file metadata |
+| Storage Account Contributor | Managed storage accounts | List storage account keys |
+| Monitoring Metrics Publisher | Data Collection Rule (DCR) | Send data via Logs Ingestion API |
+| Log Analytics Contributor | Log Analytics Workspace | Query and manage workspace |
 
 ## Documentation
 
 - [Automation Account Setup](docs/setup/automation-account-setup.md)
 - [Configure Lifecycle Rules](docs/setup/configure-lifecycle-rules.md)
+- [Log Analytics Integration](docs/setup/log-analytics-integration.md)
 - [Monitoring and Audit Logs](docs/setup/monitoring.md)
 - [Power BI Dashboard](docs/powerbi/README.md)
 

@@ -6,6 +6,9 @@
 - [ ] Logged into Azure (`Connect-AzAccount`)
 - [ ] Resource group created
 - [ ] Storage accounts created (config and audit)
+- [ ] Log Analytics Workspace created (if using Log Analytics integration)
+- [ ] Data Collection Endpoint (DCE) created (if using Log Analytics)
+- [ ] Data Collection Rule (DCR) created (if using Log Analytics)
 
 ## Option 1: Using the Deployment Script (Recommended)
 
@@ -167,7 +170,14 @@ Minimum required configuration:
         "auditLogStorageAccount": "stauditlifecycle",
         "auditLogContainer": "audit-logs",
         "fileInventoryContainer": "file-inventory",
-        "excludePatterns": ["*.tmp", "~$*"]
+        "excludePatterns": ["*.tmp", "~$*"],
+        "logAnalytics": {
+            "enabled": true,
+            "dceEndpoint": "https://your-dce.region.ingest.monitor.azure.com",
+            "dcrImmutableId": "dcr-your-immutable-id",
+            "streamName": "Custom-StgFileLifeCycle01_CL",
+            "tableName": "StgFileLifeCycle01_CL"
+        }
     },
     "storageAccounts": [
         {
@@ -196,19 +206,58 @@ Minimum required configuration:
 }
 ```
 
+## Automation Variables (Recommended for Schedules)
+
+Instead of passing parameters, configure Automation Variables:
+
+```powershell
+$rg = "rg-file-lifecycle"
+$aa = "aa-file-lifecycle"
+
+# Core variables
+New-AzAutomationVariable -ResourceGroupName $rg -AutomationAccountName $aa `
+    -Name "LifeCycle_ConfigurationPath" `
+    -Value "https://stconfiglifecycle.blob.core.windows.net/config/lifecycle-rules.json" `
+    -Encrypted $false
+
+New-AzAutomationVariable -ResourceGroupName $rg -AutomationAccountName $aa `
+    -Name "LifeCycle_DryRun" -Value "true" -Encrypted $false
+
+# Log Analytics variables (if using Log Analytics)
+New-AzAutomationVariable -ResourceGroupName $rg -AutomationAccountName $aa `
+    -Name "LifeCycle_SendToLogAnalytics" -Value "true" -Encrypted $false
+
+New-AzAutomationVariable -ResourceGroupName $rg -AutomationAccountName $aa `
+    -Name "LifeCycle_LogAnalyticsDceEndpoint" `
+    -Value "https://your-dce.region.ingest.monitor.azure.com" -Encrypted $false
+
+New-AzAutomationVariable -ResourceGroupName $rg -AutomationAccountName $aa `
+    -Name "LifeCycle_LogAnalyticsDcrImmutableId" -Value "dcr-xxx" -Encrypted $false
+
+New-AzAutomationVariable -ResourceGroupName $rg -AutomationAccountName $aa `
+    -Name "LifeCycle_LogAnalyticsStreamName" -Value "Custom-StgFileLifeCycle01_CL" -Encrypted $false
+
+New-AzAutomationVariable -ResourceGroupName $rg -AutomationAccountName $aa `
+    -Name "LifeCycle_LogAnalyticsTableName" -Value "StgFileLifeCycle01_CL" -Encrypted $false
+```
+
 ## Testing Checklist
 
 - [ ] Deploy Automation Account successfully
 - [ ] Upload and publish runbook
-- [ ] Assign permissions (wait 60 seconds after deployment)
+- [ ] Assign storage permissions (wait 60 seconds after deployment)
+- [ ] Configure Automation Variables (LifeCycle_* variables)
 - [ ] Upload configuration to blob storage
+- [ ] Assign Monitoring Metrics Publisher role on DCR (if using Log Analytics)
 - [ ] Run dry run test
 - [ ] Verify dry run logs in audit storage account
+- [ ] Verify data in Log Analytics (if enabled)
 - [ ] Disable dry run and run production test on non-critical data
 - [ ] Verify schedule is active
 
 ## Monitoring
 
+### View Automation Job Runs
 ```powershell
 # View recent job runs
 Get-AzAutomationJob `
@@ -221,4 +270,19 @@ $auditStorage = Get-AzStorageAccount -ResourceGroupName "YOUR-RG" -Name "staudit
 Get-AzStorageBlob -Context $auditStorage.Context -Container "audit-logs" |
     Sort-Object LastModified -Descending |
     Select-Object -First 10
+```
+
+### Query Log Analytics (if enabled)
+```powershell
+# Query file inventory from Log Analytics
+$workspace = Get-AzOperationalInsightsWorkspace -ResourceGroupName "rg-file-lifecycle" -Name "your-workspace"
+$query = @"
+StgFileLifeCycle01_CL
+| where TimeGenerated > ago(1d)
+| summarize TotalFiles = count(), TotalSizeGB = sum(FileSizeGB) by StorageAccount, FileShare
+| order by TotalSizeGB desc
+"@
+
+$result = Invoke-AzOperationalInsightsQuery -WorkspaceId $workspace.CustomerId -Query $query
+$result.Results
 ```

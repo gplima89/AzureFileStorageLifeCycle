@@ -54,7 +54,8 @@ Before creating the DCR, create the custom table schema in your Log Analytics wo
 2. Go to **Settings** > **Tables**
 3. Click **+ Create** > **New custom log (DCR-based)**
 4. Table name: `StgFileLifeCycle01_CL`
-5. Use the following schema (or deploy via ARM template):
+
+Use the following schema (16 columns required for file inventory):
 
 ```json
 {
@@ -62,34 +63,24 @@ Before creating the DCR, create the custom table schema in your Log Analytics wo
         { "name": "TimeGenerated", "type": "datetime" },
         { "name": "StorageAccount", "type": "string" },
         { "name": "FileShare", "type": "string" },
-        { "name": "Directory", "type": "string" },
         { "name": "FilePath", "type": "string" },
         { "name": "FileName", "type": "string" },
         { "name": "FileExtension", "type": "string" },
-        { "name": "FileCategory", "type": "string" },
         { "name": "FileSizeBytes", "type": "long" },
-        { "name": "FileSizeKB", "type": "real" },
         { "name": "FileSizeMB", "type": "real" },
         { "name": "FileSizeGB", "type": "real" },
-        { "name": "FileSizeTB", "type": "real" },
         { "name": "LastModified", "type": "datetime" },
-        { "name": "LastModifiedDate", "type": "string" },
         { "name": "Created", "type": "datetime" },
-        { "name": "CreatedDate", "type": "string" },
         { "name": "AgeInDays", "type": "int" },
-        { "name": "AgeBucket", "type": "string" },
-        { "name": "SizeBucket", "type": "string" },
-        { "name": "ContentType", "type": "string" },
         { "name": "FileHash", "type": "string" },
         { "name": "IsDuplicate", "type": "string" },
         { "name": "DuplicateCount", "type": "int" },
-        { "name": "ScanTimestamp", "type": "string" },
-        { "name": "ScanTimestampUTC", "type": "string" },
-        { "name": "ExecutionId", "type": "string" },
-        { "name": "ExecutionHost", "type": "string" }
+        { "name": "ScanTimestamp", "type": "string" }
     ]
 }
 ```
+
+> **Important**: The DCR stream declaration must include **all** fields above, including `TimeGenerated`. The runbook sends flat JSON objects, not wrapped in a `properties` object.
 
 ### Step 3: Create a Data Collection Rule (DCR)
 
@@ -134,28 +125,73 @@ After creation, note:
 
 ### Step 4: Assign Permissions to Managed Identity
 
-Grant the Automation Account's Managed Identity permission to send data:
+Grant the Automation Account's Managed Identity permission to send data. **This is critical** - the Logs Ingestion API requires the `Monitoring Metrics Publisher` role **directly on the DCR**:
 
 ```powershell
 # Get the Automation Account's Managed Identity Object ID
-$automationAccountName = "your-automation-account"
-$resourceGroup = "your-resource-group"
+$automationAccountName = "aa-file-lifecycle"
+$resourceGroup = "rg-file-lifecycle"
 
 $automationAccount = Get-AzAutomationAccount -ResourceGroupName $resourceGroup -Name $automationAccountName
-$identityId = (Get-AzADServicePrincipal -DisplayName $automationAccountName).Id
+$principalId = $automationAccount.Identity.PrincipalId
 
-# Assign "Monitoring Metrics Publisher" role on the DCR
+# Assign "Monitoring Metrics Publisher" role DIRECTLY on the DCR (required for Logs Ingestion API)
 $dcrResourceId = "/subscriptions/{sub-id}/resourceGroups/{rg}/providers/Microsoft.Insights/dataCollectionRules/{dcr-name}"
 
 New-AzRoleAssignment `
-    -ObjectId $identityId `
+    -ObjectId $principalId `
     -RoleDefinitionName "Monitoring Metrics Publisher" `
     -Scope $dcrResourceId
+
+# Also assign Log Analytics Contributor on the resource group for querying
+New-AzRoleAssignment `
+    -ObjectId $principalId `
+    -RoleDefinitionName "Log Analytics Contributor" `
+    -Scope "/subscriptions/{sub-id}/resourceGroups/{rg}"
 ```
+
+> **Important**: Role assignments can take **up to 5 minutes to propagate**. If you see 401 errors immediately after assigning roles, wait a few minutes and try again.
+
+### Required Roles Summary
+
+| Role | Scope | Purpose |
+|------|-------|---------|
+| Monitoring Metrics Publisher | DCR resource | Send data via Logs Ingestion API |
+| Log Analytics Contributor | Resource Group | Query workspace data |
 
 ### Step 5: Configure the Runbook
 
-#### Option A: Using runbook parameters
+#### Option A: Using Automation Variables (Recommended for Schedules)
+
+This is the **recommended approach** when using Azure Automation schedules, as schedules cannot pass parameters:
+
+```powershell
+$resourceGroupName = "rg-file-lifecycle"
+$automationAccountName = "aa-file-lifecycle"
+
+# Configure Log Analytics variables
+New-AzAutomationVariable -ResourceGroupName $resourceGroupName -AutomationAccountName $automationAccountName `
+    -Name "LifeCycle_SendToLogAnalytics" -Value "true" -Encrypted $false
+
+New-AzAutomationVariable -ResourceGroupName $resourceGroupName -AutomationAccountName $automationAccountName `
+    -Name "LifeCycle_LogAnalyticsDceEndpoint" `
+    -Value "https://stgfilelifecycledcedp-mgco.canadacentral-1.ingest.monitor.azure.com" -Encrypted $false
+
+New-AzAutomationVariable -ResourceGroupName $resourceGroupName -AutomationAccountName $automationAccountName `
+    -Name "LifeCycle_LogAnalyticsDcrImmutableId" -Value "dcr-f8b28d4ed32f4064a56f7b5230a8b1e5" -Encrypted $false
+
+New-AzAutomationVariable -ResourceGroupName $resourceGroupName -AutomationAccountName $automationAccountName `
+    -Name "LifeCycle_LogAnalyticsStreamName" -Value "Custom-StgFileLifeCycle01_CL" -Encrypted $false
+
+New-AzAutomationVariable -ResourceGroupName $resourceGroupName -AutomationAccountName $automationAccountName `
+    -Name "LifeCycle_LogAnalyticsTableName" -Value "StgFileLifeCycle01_CL" -Encrypted $false
+```
+
+The runbook will automatically read these variables when running.
+
+#### Option B: Using runbook parameters
+
+For manual or test runs, you can pass parameters directly:
 
 ```powershell
 .\AzureFileStorageLifecycle.ps1 `
@@ -167,7 +203,7 @@ New-AzRoleAssignment `
     -LogAnalyticsTableName "StgFileLifeCycle01_CL"
 ```
 
-#### Option B: Using configuration file
+#### Option C: Using configuration file
 
 Update `config/lifecycle-rules.json`:
 
@@ -189,6 +225,8 @@ Then run with:
 ```powershell
 .\AzureFileStorageLifecycle.ps1 -ConfigurationPath ".\config\lifecycle-rules.json" -SendToLogAnalytics
 ```
+
+> **Priority Order**: Parameters > Automation Variables > Configuration File
 
 ## Sample KQL Queries
 
@@ -245,17 +283,41 @@ StgFileLifeCycle01_CL
 
 ### Common Issues
 
-1. **401 Unauthorized**
-   - Verify the Managed Identity has "Monitoring Metrics Publisher" role on the DCR
+1. **401 Unauthorized / InvalidToken**
+   - Verify the Managed Identity has "Monitoring Metrics Publisher" role **directly on the DCR** (not just the resource group)
+   - Wait 5+ minutes after role assignment for propagation
    - Ensure the DCR Immutable ID is correct
+   - Check that the token audience is `https://monitor.azure.com`
+   
+   ```powershell
+   # Verify role assignment
+   Get-AzRoleAssignment -ObjectId $principalId -Scope $dcrResourceId
+   ```
 
 2. **404 Not Found**
-   - Check the DCE endpoint URL is correct
-   - Verify the stream name matches the DCR configuration
+   - Check the DCE endpoint URL is correct (should end with `.ingest.monitor.azure.com`)
+   - Verify the stream name matches the DCR configuration exactly
+   - Ensure DCE and DCR are in the same region as Log Analytics workspace
 
-3. **400 Bad Request**
-   - Schema mismatch between sent data and DCR definition
-   - Check for missing required fields (TimeGenerated is mandatory)
+3. **400 Bad Request / Schema Mismatch**
+   - Schema mismatch between sent data and DCR stream declaration
+   - **TimeGenerated** must be included in the DCR stream declaration
+   - Verify all field types match (datetime, string, long, real, int)
+   - Check the DCR stream declaration includes all fields being sent
+
+4. **Empty fields in Log Analytics**
+   - Data is wrapped incorrectly (should be flat JSON, not nested in `properties`)
+   - Verify the DCR stream declaration matches the flat schema
+   
+   Correct format:
+   ```json
+   [{"TimeGenerated":"2026-01-08T...","StorageAccount":"mystg","FileName":"test.txt"}]
+   ```
+   
+   Incorrect format:
+   ```json
+   [{"TimeGenerated":"2026-01-08T...","properties":{"StorageAccount":"mystg"}}]
+   ```
 
 ### Testing the Connection
 
@@ -307,13 +369,53 @@ With the integrated module, you only need to upload **one module** to your Autom
 
 This single module includes both file inventory and Log Analytics functionality.
 
-## Your Configuration
+## Configuration Reference
 
-Based on your setup, use these values:
+After completing setup, note these values for your environment:
 
-| Setting | Value |
-|---------|-------|
-| **DCE Endpoint** | `https://stgfilelifecycledcedp-mgco.canadacentral-1.ingest.monitor.azure.com` |
-| **DCR Immutable ID** | `dcr-f8b28d4ed32f4064a56f7b5230a8b1e5` |
-| **Stream Name** | `Custom-StgFileLifeCycle01_CL` |
-| **Table Name** | `StgFileLifeCycle01_CL` |
+| Setting | Description | How to Find |
+|---------|-------------|-------------|
+| **DCE Endpoint** | Logs Ingestion URI | DCE Properties > Logs Ingestion > endpoint |
+| **DCR Immutable ID** | Unique DCR identifier | DCR Properties > Immutable ID (starts with `dcr-`) |
+| **Stream Name** | Custom stream name | Always `Custom-{TableName}` (e.g., `Custom-StgFileLifeCycle01_CL`) |
+| **Table Name** | Log Analytics table | The table you created (e.g., `StgFileLifeCycle01_CL`) |
+
+### Example Configuration
+
+```powershell
+# Example Automation Variables setup
+$rg = "rg-file-lifecycle"
+$aa = "aa-file-lifecycle"
+
+# Your actual values - replace these!
+$dceEndpoint = "https://your-dce-name.region.ingest.monitor.azure.com"
+$dcrImmutableId = "dcr-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+$streamName = "Custom-StgFileLifeCycle01_CL"
+$tableName = "StgFileLifeCycle01_CL"
+
+# Create variables
+@{
+    "LifeCycle_SendToLogAnalytics" = "true"
+    "LifeCycle_LogAnalyticsDceEndpoint" = $dceEndpoint
+    "LifeCycle_LogAnalyticsDcrImmutableId" = $dcrImmutableId
+    "LifeCycle_LogAnalyticsStreamName" = $streamName
+    "LifeCycle_LogAnalyticsTableName" = $tableName
+}.GetEnumerator() | ForEach-Object {
+    New-AzAutomationVariable -ResourceGroupName $rg -AutomationAccountName $aa `
+        -Name $_.Key -Value $_.Value -Encrypted $false
+}
+```
+
+## Verifying Data Ingestion
+
+After running the lifecycle runbook, verify data appears in Log Analytics:
+
+```kql
+// Check recent ingestion
+StgFileLifeCycle01_CL
+| where TimeGenerated > ago(1h)
+| take 10
+| project TimeGenerated, StorageAccount, FileName, FileSizeBytes
+```
+
+Data typically appears within 2-5 minutes after the runbook completes.

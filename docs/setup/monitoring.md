@@ -150,7 +150,95 @@ The file inventory CSV provides a complete snapshot of all files:
 | `ScanTimestamp` | When scan was performed |
 | `SizeRank` | Rank by size (1 = largest) |
 
-### Analyzing File Inventory
+## Log Analytics Monitoring
+
+If Log Analytics integration is enabled, you can query file inventory data directly in Azure Monitor.
+
+### Basic KQL Queries
+
+```kql
+// Total storage by account
+StgFileLifeCycle01_CL
+| where TimeGenerated > ago(1d)
+| summarize TotalFiles = count(), TotalSizeGB = sum(FileSizeGB) by StorageAccount
+| order by TotalSizeGB desc
+```
+
+```kql
+// Files by extension
+StgFileLifeCycle01_CL
+| where TimeGenerated > ago(1d)
+| summarize FileCount = count(), TotalSizeMB = sum(FileSizeMB) by FileExtension
+| order by TotalSizeMB desc
+| take 20
+```
+
+```kql
+// Old files that may need attention
+StgFileLifeCycle01_CL
+| where TimeGenerated > ago(1d)
+| where AgeInDays > 365
+| summarize FileCount = count(), TotalSizeGB = sum(FileSizeGB) by StorageAccount, FileShare
+| order by TotalSizeGB desc
+```
+
+```kql
+// Largest files
+StgFileLifeCycle01_CL
+| where TimeGenerated > ago(1d)
+| top 50 by FileSizeBytes desc
+| project StorageAccount, FileShare, FileName, FileSizeMB, FileExtension, AgeInDays
+```
+
+### PowerShell Log Analytics Queries
+
+```powershell
+# Query Log Analytics from PowerShell
+$workspace = Get-AzOperationalInsightsWorkspace -ResourceGroupName "rg-file-lifecycle" -Name "your-workspace"
+
+# Latest file inventory
+$query = "StgFileLifeCycle01_CL | where TimeGenerated > ago(1h) | take 100"
+$result = Invoke-AzOperationalInsightsQuery -WorkspaceId $workspace.CustomerId -Query $query
+$result.Results | Format-Table
+
+# Storage summary by account
+$summaryQuery = @"
+StgFileLifeCycle01_CL
+| where TimeGenerated > ago(1d)
+| summarize TotalFiles = count(), TotalSizeGB = sum(FileSizeGB), AvgFileSizeMB = avg(FileSizeMB) by StorageAccount, FileShare
+| order by TotalSizeGB desc
+"@
+$summary = Invoke-AzOperationalInsightsQuery -WorkspaceId $workspace.CustomerId -Query $summaryQuery
+$summary.Results
+```
+
+### Create Log Analytics Alerts
+
+Create alerts based on file inventory data:
+
+```powershell
+# Create alert when storage exceeds threshold
+$workspaceId = "/subscriptions/<sub-id>/resourceGroups/rg-file-lifecycle/providers/Microsoft.OperationalInsights/workspaces/your-workspace"
+
+$query = @"
+StgFileLifeCycle01_CL
+| where TimeGenerated > ago(1d)
+| summarize TotalSizeGB = sum(FileSizeGB) by StorageAccount
+| where TotalSizeGB > 100
+"@
+
+# Create Scheduled Query Rule (Log Alert)
+New-AzScheduledQueryRule `
+    -Name "StorageThresholdAlert" `
+    -ResourceGroupName "rg-file-lifecycle" `
+    -Location "eastus" `
+    -Scope $workspaceId `
+    -EvaluationFrequency "PT1H" `
+    -WindowSize "PT1H" `
+    -Severity 3
+```
+
+### Analyzing File Inventory (CSV)
 
 ```powershell
 # Load file inventory

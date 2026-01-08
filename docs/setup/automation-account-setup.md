@@ -160,15 +160,79 @@ Write-Host "Schedule created: $scheduleName"
 Write-Host "Next run: $nextSunday"
 ```
 
-## Step 7: Link Schedule to Runbook
+## Step 7: Configure Automation Variables (Recommended for Schedulers)
+
+Automation Variables allow the runbook to read configuration without passing parameters, which is required when using schedules:
 
 ```powershell
-# Parameters for the runbook
+$resourceGroupName = "rg-file-lifecycle"
+$automationAccountName = "aa-file-lifecycle"
+
+# Core configuration variables
+New-AzAutomationVariable -ResourceGroupName $resourceGroupName -AutomationAccountName $automationAccountName `
+    -Name "LifeCycle_ConfigurationPath" `
+    -Value "https://stconfiglifecycle.blob.core.windows.net/config/lifecycle-rules.json" `
+    -Encrypted $false
+
+New-AzAutomationVariable -ResourceGroupName $resourceGroupName -AutomationAccountName $automationAccountName `
+    -Name "LifeCycle_DryRun" `
+    -Value "true" `
+    -Encrypted $false
+
+# Log Analytics configuration variables
+New-AzAutomationVariable -ResourceGroupName $resourceGroupName -AutomationAccountName $automationAccountName `
+    -Name "LifeCycle_SendToLogAnalytics" `
+    -Value "true" `
+    -Encrypted $false
+
+New-AzAutomationVariable -ResourceGroupName $resourceGroupName -AutomationAccountName $automationAccountName `
+    -Name "LifeCycle_LogAnalyticsDceEndpoint" `
+    -Value "https://your-dce.region.ingest.monitor.azure.com" `
+    -Encrypted $false
+
+New-AzAutomationVariable -ResourceGroupName $resourceGroupName -AutomationAccountName $automationAccountName `
+    -Name "LifeCycle_LogAnalyticsDcrImmutableId" `
+    -Value "dcr-your-immutable-id" `
+    -Encrypted $false
+
+New-AzAutomationVariable -ResourceGroupName $resourceGroupName -AutomationAccountName $automationAccountName `
+    -Name "LifeCycle_LogAnalyticsStreamName" `
+    -Value "Custom-StgFileLifeCycle01_CL" `
+    -Encrypted $false
+
+New-AzAutomationVariable -ResourceGroupName $resourceGroupName -AutomationAccountName $automationAccountName `
+    -Name "LifeCycle_LogAnalyticsTableName" `
+    -Value "StgFileLifeCycle01_CL" `
+    -Encrypted $false
+```
+
+### Available Automation Variables
+
+| Variable Name | Description | Example Value |
+|--------------|-------------|---------------|
+| `LifeCycle_ConfigurationPath` | Blob URL to config file | `https://storage.blob.core.windows.net/config/lifecycle-rules.json` |
+| `LifeCycle_DryRun` | Enable/disable dry run mode | `true` or `false` |
+| `LifeCycle_SendToLogAnalytics` | Enable Log Analytics streaming | `true` or `false` |
+| `LifeCycle_LogAnalyticsDceEndpoint` | DCE Logs Ingestion endpoint | `https://dce.region.ingest.monitor.azure.com` |
+| `LifeCycle_LogAnalyticsDcrImmutableId` | DCR Immutable ID | `dcr-f8b28d4ed32f...` |
+| `LifeCycle_LogAnalyticsStreamName` | Custom stream name | `Custom-StgFileLifeCycle01_CL` |
+| `LifeCycle_LogAnalyticsTableName` | Log Analytics table name | `StgFileLifeCycle01_CL` |
+
+## Step 8: Link Schedule to Runbook
+
+```powershell
+# When using Automation Variables, no parameters are needed
+Register-AzAutomationScheduledRunbook `
+    -ResourceGroupName $resourceGroupName `
+    -AutomationAccountName $automationAccountName `
+    -RunbookName "AzureFileStorageLifecycle" `
+    -ScheduleName $scheduleName
+
+# Or with parameter overrides (parameters take precedence over variables)
 $runbookParams = @{
     ConfigurationPath = "https://stconfiglifecycle.blob.core.windows.net/config/lifecycle-rules.json"
 }
 
-# Link schedule to runbook
 Register-AzAutomationScheduledRunbook `
     -ResourceGroupName $resourceGroupName `
     -AutomationAccountName $automationAccountName `
@@ -258,9 +322,12 @@ $output | ForEach-Object { Write-Host $_.Summary }
 - [ ] Az.Accounts and Az.Storage modules imported
 - [ ] Runbook imported and published
 - [ ] Managed identity has required roles on storage accounts
+- [ ] Automation Variables configured (LifeCycle_* variables)
 - [ ] Schedule created (Weekly, Sundays, 2:00 AM)
-- [ ] Schedule linked to runbook with correct parameters
+- [ ] Schedule linked to runbook
 - [ ] Configuration file uploaded to blob storage
+- [ ] Log Analytics DCR/DCE created (if using Log Analytics)
+- [ ] Monitoring Metrics Publisher role assigned on DCR
 - [ ] Dry run test completed successfully
 
 ## Troubleshooting

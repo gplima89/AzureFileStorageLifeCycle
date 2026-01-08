@@ -35,12 +35,25 @@
     
 .PARAMETER LogAnalyticsTableName
     Target table name in Log Analytics (e.g., StgFileLifeCycle01_CL)
+    
+.NOTES
+    AUTOMATION VARIABLES (Alternative to Parameters):
+    When running via schedule, you can use Automation Account Variables instead of parameters:
+    - LifeCycle_ConfigurationPath     : Blob URL to config file
+    - LifeCycle_DryRun                : "true" or "false"
+    - LifeCycle_SendToLogAnalytics    : "true" or "false"
+    - LifeCycle_LogAnalyticsDceEndpoint
+    - LifeCycle_LogAnalyticsDcrImmutableId
+    - LifeCycle_LogAnalyticsStreamName
+    - LifeCycle_LogAnalyticsTableName
+    
+    Parameters take precedence over variables if both are provided.
 #>
 
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $false)]
-    [string]$ConfigurationPath = ".\config\lifecycle-rules.json",
+    [string]$ConfigurationPath = "",
     
     [Parameter(Mandatory = $false)]
     [switch]$DryRun,
@@ -73,30 +86,374 @@ catch {
     Write-Error "Failed to import required Az modules: $_"
     throw
 }
+#endregion
 
-# Import FileInventory module (includes Log Analytics ingestion functions)
-try {
-    $scriptPath = $PSScriptRoot
-    if (-not $scriptPath) { $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path }
-    $modulePath = Join-Path (Split-Path -Parent $scriptPath) "modules\FileInventory.psm1"
+#region Automation Variable Resolution
+# This function retrieves configuration from Automation Variables with parameter override
+function Get-AutomationVariableOrDefault {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [string]$VariableName,
+        [string]$ParameterValue,
+        [string]$DefaultValue = ""
+    )
     
-    if (Test-Path $modulePath) {
-        Import-Module $modulePath -ErrorAction Stop
-        Write-Output "FileInventory module loaded from: $modulePath"
+    # If parameter is provided and not empty, use it
+    if (-not [string]::IsNullOrWhiteSpace($ParameterValue)) {
+        return [string]$ParameterValue
     }
-    else {
-        # Try from Automation Account modules
-        Import-Module FileInventory -ErrorAction Stop
-        Write-Output "FileInventory module loaded from Automation Account"
+    
+    # Try to get from Automation Variable
+    try {
+        $value = Get-AutomationVariable -Name $VariableName -ErrorAction SilentlyContinue
+        if ($null -ne $value -and -not [string]::IsNullOrWhiteSpace([string]$value)) {
+            # Use Write-Verbose instead of Write-Output to avoid polluting return value
+            Write-Verbose "Using Automation Variable: $VariableName = $value"
+            return [string]$value
+        }
+    }
+    catch {
+        # Variable doesn't exist or not running in Automation Account
+        Write-Verbose "Automation Variable '$VariableName' not found or not in Automation Account context"
+    }
+    
+    return [string]$DefaultValue
+}
+
+# Resolve configuration from variables or parameters
+$resolvedConfig = @{
+    ConfigurationPath         = Get-AutomationVariableOrDefault -VariableName "LifeCycle_ConfigurationPath" -ParameterValue $ConfigurationPath -DefaultValue ".\config\lifecycle-rules.json"
+    DryRun                    = $false
+    SendToLogAnalytics        = $false
+    LogAnalyticsDceEndpoint   = Get-AutomationVariableOrDefault -VariableName "LifeCycle_LogAnalyticsDceEndpoint" -ParameterValue $LogAnalyticsDceEndpoint
+    LogAnalyticsDcrImmutableId = Get-AutomationVariableOrDefault -VariableName "LifeCycle_LogAnalyticsDcrImmutableId" -ParameterValue $LogAnalyticsDcrImmutableId
+    LogAnalyticsStreamName    = Get-AutomationVariableOrDefault -VariableName "LifeCycle_LogAnalyticsStreamName" -ParameterValue $LogAnalyticsStreamName
+    LogAnalyticsTableName     = Get-AutomationVariableOrDefault -VariableName "LifeCycle_LogAnalyticsTableName" -ParameterValue $LogAnalyticsTableName
+}
+
+# Handle boolean switches - parameters override variables
+if ($DryRun.IsPresent) {
+    $resolvedConfig.DryRun = $true
+} else {
+    $dryRunVar = Get-AutomationVariableOrDefault -VariableName "LifeCycle_DryRun" -ParameterValue "" -DefaultValue "false"
+    $resolvedConfig.DryRun = $dryRunVar -eq "true"
+}
+
+if ($SendToLogAnalytics.IsPresent) {
+    $resolvedConfig.SendToLogAnalytics = $true
+} else {
+    $sendToLAVar = Get-AutomationVariableOrDefault -VariableName "LifeCycle_SendToLogAnalytics" -ParameterValue "" -DefaultValue "false"
+    $resolvedConfig.SendToLogAnalytics = $sendToLAVar -eq "true"
+}
+
+# Use resolved values with distinct names (to avoid switch parameter conflicts)
+$script:EffectiveConfigPath = $resolvedConfig.ConfigurationPath
+$script:EffectiveDryRun = $resolvedConfig.DryRun
+$script:EffectiveSendToLogAnalytics = $resolvedConfig.SendToLogAnalytics
+$script:EffectiveLogAnalyticsDceEndpoint = $resolvedConfig.LogAnalyticsDceEndpoint
+$script:EffectiveLogAnalyticsDcrImmutableId = $resolvedConfig.LogAnalyticsDcrImmutableId
+$script:EffectiveLogAnalyticsStreamName = $resolvedConfig.LogAnalyticsStreamName
+$script:EffectiveLogAnalyticsTableName = $resolvedConfig.LogAnalyticsTableName
+#endregion
+
+#region Log Analytics Ingestion Functions (Inline for Automation Account compatibility)
+
+# Module-level variables for Log Analytics configuration
+$script:LogAnalyticsConfig = @{
+    DceEndpoint       = ""
+    DcrImmutableId    = ""
+    StreamName        = ""
+    TableName         = ""
+    BatchSize         = 500
+    MaxRetries        = 3
+    RetryDelaySeconds = 5
+}
+
+function Initialize-LogAnalyticsIngestion {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DceEndpoint,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$DcrImmutableId,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$StreamName,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$TableName,
+        
+        [Parameter(Mandatory = $false)]
+        [int]$BatchSize = 500
+    )
+    
+    $script:LogAnalyticsConfig.DceEndpoint = $DceEndpoint.TrimEnd('/')
+    $script:LogAnalyticsConfig.DcrImmutableId = $DcrImmutableId
+    $script:LogAnalyticsConfig.StreamName = $StreamName
+    $script:LogAnalyticsConfig.TableName = $TableName
+    $script:LogAnalyticsConfig.BatchSize = $BatchSize
+    
+    Write-Output "Log Analytics Ingestion initialized: Table=$TableName"
+}
+
+function Get-LogAnalyticsAccessToken {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+    
+    try {
+        Write-Warning "[DEBUG] Requesting access token for https://monitor.azure.com..."
+        $token = Get-AzAccessToken -ResourceUrl "https://monitor.azure.com" -ErrorAction Stop
+        Write-Warning "[DEBUG] Token object received, type: $($token.GetType().Name)"
+        Write-Warning "[DEBUG] Token.Token type: $($token.Token.GetType().Name)"
+        
+        if (-not $token) {
+            throw "Failed to obtain access token for Azure Monitor - token is null"
+        }
+        
+        # Handle both string and SecureString token formats (Az.Accounts version differences)
+        $tokenValue = $token.Token
+        if ($tokenValue -is [System.Security.SecureString]) {
+            Write-Warning "[DEBUG] Converting SecureString token..."
+            $tokenValue = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($tokenValue)
+            )
+        }
+        
+        if ([string]::IsNullOrEmpty($tokenValue)) {
+            throw "Failed to obtain access token for Azure Monitor - token is empty"
+        }
+        
+        Write-Warning "[DEBUG] Access token obtained (length: $($tokenValue.Length), first 50 chars: $($tokenValue.Substring(0, [Math]::Min(50, $tokenValue.Length))))"
+        return $tokenValue
+    }
+    catch {
+        Write-Error "Failed to get access token: $_"
+        throw
     }
 }
-catch {
-    Write-Warning "Failed to import FileInventory module: $_"
-    if ($SendToLogAnalytics) {
-        Write-Warning "Log Analytics integration will be skipped"
-        $SendToLogAnalytics = $false
+
+function ConvertTo-LogAnalyticsJson {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject[]]$Data
+    )
+    
+    $formattedData = foreach ($item in $Data) {
+        $hash = @{}
+        foreach ($prop in $item.PSObject.Properties) {
+            $value = $prop.Value
+            if ($value -is [DateTime]) {
+                $hash[$prop.Name] = $value.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+            }
+            elseif ($null -eq $value) {
+                $hash[$prop.Name] = $null
+            }
+            elseif ($value -is [bool]) {
+                $hash[$prop.Name] = $value
+            }
+            elseif ($value -is [int] -or $value -is [long] -or $value -is [double] -or $value -is [decimal]) {
+                $hash[$prop.Name] = $value
+            }
+            else {
+                $hash[$prop.Name] = $value.ToString()
+            }
+        }
+        
+        # Ensure TimeGenerated is set
+        if (-not $hash.ContainsKey('TimeGenerated')) {
+            $hash['TimeGenerated'] = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+        }
+        
+        # Return flat object - DCR schema expects flat fields, not wrapped in properties
+        [PSCustomObject]$hash
+    }
+    return ($formattedData | ConvertTo-Json -Depth 10 -Compress)
+}
+
+function Send-ToLogAnalytics {
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param(
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+        [PSCustomObject[]]$Data,
+        
+        [Parameter(Mandatory = $false)]
+        [string]$DataType = "Data"
+    )
+    
+    begin {
+        $allData = [System.Collections.Generic.List[PSCustomObject]]::new()
+        $startTime = Get-Date
+    }
+    
+    process {
+        foreach ($item in $Data) {
+            $allData.Add($item)
+        }
+    }
+    
+    end {
+        if ($allData.Count -eq 0) {
+            return [PSCustomObject]@{ Success = $true; TotalRecords = 0; Message = "No data to send" }
+        }
+        
+        if (-not $script:LogAnalyticsConfig.DceEndpoint) {
+            throw "Log Analytics not initialized. Call Initialize-LogAnalyticsIngestion first."
+        }
+        
+        Write-Output "Sending $($allData.Count) $DataType records to Log Analytics..."
+        
+        $accessToken = Get-LogAnalyticsAccessToken
+        $uri = "$($script:LogAnalyticsConfig.DceEndpoint)/dataCollectionRules/$($script:LogAnalyticsConfig.DcrImmutableId)/streams/$($script:LogAnalyticsConfig.StreamName)?api-version=2023-01-01"
+        
+        # Debug: Log the URI and auth header format
+        Write-Warning "[DEBUG] Log Analytics Ingestion URI: $uri"
+        Write-Warning "[DEBUG] Token length in header: $($accessToken.Length)"
+        Write-Warning "[DEBUG] Token type in header: $($accessToken.GetType().Name)"
+        Write-Warning "[DEBUG] Auth header value (first 60 chars): Bearer $($accessToken.Substring(0, [Math]::Min(50, $accessToken.Length)))..."
+        
+        $headers = @{
+            "Authorization" = "Bearer $accessToken"
+            "Content-Type"  = "application/json"
+        }
+        
+        $batchSize = $script:LogAnalyticsConfig.BatchSize
+        $totalBatches = [Math]::Ceiling($allData.Count / $batchSize)
+        $successfulBatches = 0
+        $failedBatches = 0
+        $totalRecordsSent = 0
+        
+        for ($i = 0; $i -lt $allData.Count; $i += $batchSize) {
+            $batchNumber = [Math]::Floor($i / $batchSize) + 1
+            $endIndex = [Math]::Min($i + $batchSize - 1, $allData.Count - 1)
+            $batch = $allData[$i..$endIndex]
+            
+            Write-Output "Sending batch $batchNumber of $totalBatches ($($batch.Count) records)..."
+            $jsonBody = ConvertTo-LogAnalyticsJson -Data $batch
+            
+            $retryCount = 0
+            $success = $false
+            
+            while (-not $success -and $retryCount -lt $script:LogAnalyticsConfig.MaxRetries) {
+                try {
+                    $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $jsonBody -ErrorAction Stop
+                    $success = $true
+                    $successfulBatches++
+                    $totalRecordsSent += $batch.Count
+                }
+                catch {
+                    $retryCount++
+                    $statusCode = $_.Exception.Response.StatusCode.value__
+                    $errorMessage = $_.Exception.Message
+                    
+                    # Try to get response body for more details
+                    $responseBody = ""
+                    try {
+                        $reader = [System.IO.StreamReader]::new($_.Exception.Response.GetResponseStream())
+                        $responseBody = $reader.ReadToEnd()
+                        $reader.Close()
+                    } catch { }
+                    
+                    Write-Warning "Batch $batchNumber failed (attempt $retryCount): Status $statusCode - $errorMessage"
+                    if ($responseBody) {
+                        Write-Warning "Response body: $responseBody"
+                    }
+                    
+                    if ($statusCode -eq 429) {
+                        Start-Sleep -Seconds ($script:LogAnalyticsConfig.RetryDelaySeconds * $retryCount * 2)
+                    }
+                    elseif ($statusCode -in @(401, 403)) {
+                        $accessToken = Get-LogAnalyticsAccessToken
+                        $headers["Authorization"] = "Bearer $accessToken"
+                        Start-Sleep -Seconds $script:LogAnalyticsConfig.RetryDelaySeconds
+                    }
+                    elseif ($statusCode -ge 500) {
+                        Start-Sleep -Seconds ($script:LogAnalyticsConfig.RetryDelaySeconds * $retryCount)
+                    }
+                    else {
+                        break
+                    }
+                }
+            }
+            
+            if (-not $success) {
+                $failedBatches++
+            }
+        }
+        
+        $duration = (Get-Date) - $startTime
+        
+        return [PSCustomObject]@{
+            Success         = ($failedBatches -eq 0)
+            TotalRecords    = $allData.Count
+            RecordsSent     = $totalRecordsSent
+            BatchesSent     = $successfulBatches
+            TotalBatches    = $totalBatches
+            FailedBatches   = $failedBatches
+            DurationSeconds = [math]::Round($duration.TotalSeconds, 2)
+            TableName       = $script:LogAnalyticsConfig.TableName
+            Message         = if ($failedBatches -eq 0) { "Successfully sent $totalRecordsSent records" } else { "Sent $totalRecordsSent of $($allData.Count) records. $failedBatches batches failed." }
+        }
     }
 }
+
+function Send-FileInventoryToLogAnalytics {
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param(
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+        [PSCustomObject[]]$FileInventory,
+        
+        [Parameter(Mandatory = $false)]
+        [switch]$IncludeExecutionMetadata,
+        
+        [Parameter(Mandatory = $false)]
+        [string]$ExecutionId = [guid]::NewGuid().ToString()
+    )
+    
+    begin {
+        $allInventory = [System.Collections.Generic.List[PSCustomObject]]::new()
+    }
+    
+    process {
+        foreach ($item in $FileInventory) {
+            $allInventory.Add($item)
+        }
+    }
+    
+    end {
+        if ($allInventory.Count -eq 0) {
+            Write-Warning "No file inventory data to send"
+            return
+        }
+        
+        if ($IncludeExecutionMetadata) {
+            $hostName = $env:COMPUTERNAME
+            $timestamp = (Get-Date).ToUniversalTime()
+            foreach ($item in $allInventory) {
+                $item | Add-Member -NotePropertyName "ExecutionId" -NotePropertyValue $ExecutionId -Force
+                $item | Add-Member -NotePropertyName "ExecutionHost" -NotePropertyValue $hostName -Force
+                $item | Add-Member -NotePropertyName "TimeGenerated" -NotePropertyValue $timestamp -Force
+            }
+        }
+        else {
+            $timestamp = (Get-Date).ToUniversalTime()
+            foreach ($item in $allInventory) {
+                if (-not ($item.PSObject.Properties.Name -contains 'TimeGenerated')) {
+                    $item | Add-Member -NotePropertyName "TimeGenerated" -NotePropertyValue $timestamp -Force
+                }
+            }
+        }
+        
+        return $allInventory | Send-ToLogAnalytics -DataType "FileInventory"
+    }
+}
+
 #endregion
 
 #region Global Variables
@@ -186,15 +543,33 @@ function Get-LifecycleConfiguration {
     try {
         # Check if ConfigPath is a URL (blob storage)
         if ($ConfigPath -match '^https?://') {
-            Write-Log "Configuration is a URL, downloading from: $ConfigPath" -Level Information
-            $configContent = Invoke-RestMethod -Uri $ConfigPath -Method Get -ErrorAction Stop
+            Write-Log "Configuration is a URL, downloading from blob storage..." -Level Information
             
-            # Convert to JSON if it's not already
-            if ($configContent -is [string]) {
+            # Parse the blob URL to extract storage account, container, and blob name
+            # Format: https://<storage-account>.blob.core.windows.net/<container>/<blob-path>
+            $uri = [System.Uri]$ConfigPath
+            $storageAccountName = $uri.Host.Split('.')[0]
+            $pathParts = $uri.AbsolutePath.TrimStart('/').Split('/', 2)
+            $containerName = $pathParts[0]
+            $blobName = $pathParts[1]
+            
+            Write-Log "Storage Account: $storageAccountName, Container: $containerName, Blob: $blobName" -Level Information
+            
+            # Get storage context using Managed Identity (OAuth)
+            $storageContext = New-AzStorageContext -StorageAccountName $storageAccountName -UseConnectedAccount -ErrorAction Stop
+            
+            # Download blob content to memory
+            $tempFile = [System.IO.Path]::GetTempFileName()
+            try {
+                Get-AzStorageBlobContent -Container $containerName -Blob $blobName -Destination $tempFile -Context $storageContext -Force -ErrorAction Stop | Out-Null
+                $configContent = Get-Content -Path $tempFile -Raw
                 $config = $configContent | ConvertFrom-Json
             }
-            else {
-                $config = $configContent
+            finally {
+                # Clean up temp file
+                if (Test-Path $tempFile) {
+                    Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+                }
             }
         }
         else {
@@ -337,7 +712,7 @@ function Add-AuditLogEntry {
         [long]$FileSizeBytes = 0,
         
         [Parameter(Mandatory = $false)]
-        [datetime]$FileLastModified,
+        $FileLastModified,  # Accept any type (DateTime or DateTimeOffset)
         
         [Parameter(Mandatory = $false)]
         [string]$Status = "Success",
@@ -345,6 +720,9 @@ function Add-AuditLogEntry {
         [Parameter(Mandatory = $false)]
         [string]$ErrorMessage = ""
     )
+    
+    # Convert DateTimeOffset to DateTime if needed
+    $fileLastModifiedDT = if ($FileLastModified -is [DateTimeOffset]) { $FileLastModified.DateTime } elseif ($FileLastModified) { $FileLastModified } else { $null }
     
     $entry = [PSCustomObject]@{
         Timestamp         = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -355,7 +733,7 @@ function Add-AuditLogEntry {
         RuleName          = $RuleName
         FileSizeBytes     = $FileSizeBytes
         FileSizeMB        = [math]::Round($FileSizeBytes / 1MB, 2)
-        FileLastModified  = $FileLastModified
+        FileLastModified  = $fileLastModifiedDT
         Status            = $Status
         ErrorMessage      = $ErrorMessage
         DryRun            = $script:DryRunMode
@@ -384,10 +762,10 @@ function Add-FileInventoryEntry {
         [long]$FileSizeBytes,
         
         [Parameter(Mandatory = $false)]
-        [datetime]$LastModified,
+        $LastModified,  # Accept any type (DateTime or DateTimeOffset)
         
         [Parameter(Mandatory = $false)]
-        [datetime]$Created,
+        $Created,  # Accept any type (DateTime or DateTimeOffset)
         
         [Parameter(Mandatory = $false)]
         [string]$FileExtension = "",
@@ -395,6 +773,10 @@ function Add-FileInventoryEntry {
         [Parameter(Mandatory = $false)]
         [string]$FileHash = ""
     )
+    
+    # Convert DateTimeOffset to DateTime if needed
+    $lastModifiedDT = if ($LastModified -is [DateTimeOffset]) { $LastModified.DateTime } elseif ($LastModified) { [datetime]$LastModified } else { $null }
+    $createdDT = if ($Created -is [DateTimeOffset]) { $Created.DateTime } elseif ($Created) { [datetime]$Created } else { $null }
     
     $entry = [PSCustomObject]@{
         StorageAccount    = $StorageAccount
@@ -405,9 +787,9 @@ function Add-FileInventoryEntry {
         FileSizeBytes     = $FileSizeBytes
         FileSizeMB        = [math]::Round($FileSizeBytes / 1MB, 2)
         FileSizeGB        = [math]::Round($FileSizeBytes / 1GB, 4)
-        LastModified      = $LastModified
-        Created           = $Created
-        AgeInDays         = if ($LastModified) { [math]::Round((Get-Date).Subtract($LastModified).TotalDays, 0) } else { $null }
+        LastModified      = $lastModifiedDT
+        Created           = $createdDT
+        AgeInDays         = if ($lastModifiedDT) { [math]::Round((Get-Date).Subtract($lastModifiedDT).TotalDays, 0) } else { $null }
         FileHash          = $FileHash
         IsDuplicate       = "No"
         DuplicateCount    = 0
@@ -1023,8 +1405,8 @@ try {
     Write-Log "Azure File Storage Lifecycle Management" -Level Information
     Write-Log "========================================" -Level Information
     
-    # Set dry run mode
-    $script:DryRunMode = $DryRun.IsPresent
+    # Set dry run mode (from resolved effective configuration)
+    $script:DryRunMode = $script:EffectiveDryRun
     if ($script:DryRunMode) {
         Write-Log "*** DRY RUN MODE ENABLED - No changes will be made ***" -Level Warning
     }
@@ -1033,10 +1415,10 @@ try {
     Connect-AzureWithManagedIdentity
     
     # Load configuration
-    $config = Get-LifecycleConfiguration -ConfigPath $ConfigurationPath
+    $config = Get-LifecycleConfiguration -ConfigPath $script:EffectiveConfigPath
     
-    # Override dry run from config if specified
-    if ($config.globalSettings.dryRun -and -not $DryRun.IsPresent) {
+    # Override dry run from config if not already set
+    if ($config.globalSettings.dryRun -and -not $script:DryRunMode) {
         $script:DryRunMode = $true
         Write-Log "Dry run enabled via configuration" -Level Information
     }
@@ -1180,24 +1562,24 @@ try {
     }
     
     # Send file inventory to Log Analytics if enabled
-    if ($SendToLogAnalytics -and $script:FileInventory.Count -gt 0) {
+    if ($script:EffectiveSendToLogAnalytics -and $script:FileInventory.Count -gt 0) {
         Write-Log "Sending file inventory to Log Analytics..." -Level Information
         
         try {
-            # Get Log Analytics settings from config or parameters
-            $dceEndpoint = if ($LogAnalyticsDceEndpoint) { $LogAnalyticsDceEndpoint } 
+            # Get Log Analytics settings from effective config or JSON config
+            $dceEndpoint = if ($script:EffectiveLogAnalyticsDceEndpoint) { $script:EffectiveLogAnalyticsDceEndpoint } 
                            elseif ($config.globalSettings.logAnalytics.dceEndpoint) { $config.globalSettings.logAnalytics.dceEndpoint }
                            else { "" }
             
-            $dcrImmutableId = if ($LogAnalyticsDcrImmutableId) { $LogAnalyticsDcrImmutableId }
+            $dcrImmutableId = if ($script:EffectiveLogAnalyticsDcrImmutableId) { $script:EffectiveLogAnalyticsDcrImmutableId }
                               elseif ($config.globalSettings.logAnalytics.dcrImmutableId) { $config.globalSettings.logAnalytics.dcrImmutableId }
                               else { "" }
             
-            $streamName = if ($LogAnalyticsStreamName) { $LogAnalyticsStreamName }
+            $streamName = if ($script:EffectiveLogAnalyticsStreamName) { $script:EffectiveLogAnalyticsStreamName }
                           elseif ($config.globalSettings.logAnalytics.streamName) { $config.globalSettings.logAnalytics.streamName }
                           else { "" }
             
-            $tableName = if ($LogAnalyticsTableName) { $LogAnalyticsTableName }
+            $tableName = if ($script:EffectiveLogAnalyticsTableName) { $script:EffectiveLogAnalyticsTableName }
                          elseif ($config.globalSettings.logAnalytics.tableName) { $config.globalSettings.logAnalytics.tableName }
                          else { "" }
             

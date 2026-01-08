@@ -5,7 +5,7 @@
     "globalSettings": {
         "dryRun": false,
         "logLevel": "Information",
-        "auditLogStorageAccount": "yourstorageaccount",
+        "auditLogStorageAccount": "labazstglifecycle",
         "auditLogContainer": "audit-logs",
         "fileInventoryContainer": "file-inventory",
         "retainAuditLogsDays": 90,
@@ -26,13 +26,13 @@
     },
     "storageAccounts": [
         {
-            "name": "storageaccount1",
-            "resourceGroup": "rg-storage-prod",
-            "subscriptionId": "00000000-0000-0000-0000-000000000000",
+            "name": "labazstglifecycle",
+            "resourceGroup": "LABAZSTG",
+            "subscriptionId": "dd8df97d-4198-4753-855e-40b86901b818",
             "enabled": true,
             "fileShares": [
                 {
-                    "name": "fileshare1",
+                    "name": "lifecycle",
                     "enabled": true,
                     "rules": [
                         {
