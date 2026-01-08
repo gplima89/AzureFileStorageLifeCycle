@@ -74,25 +74,25 @@ catch {
     throw
 }
 
-# Import Log Analytics module if sending is enabled
-if ($SendToLogAnalytics) {
-    try {
-        # Try to import from same directory as runbook
-        $scriptPath = $PSScriptRoot
-        if (-not $scriptPath) { $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path }
-        $modulePath = Join-Path (Split-Path -Parent $scriptPath) "modules\LogAnalyticsIngestion.psm1"
-        
-        if (Test-Path $modulePath) {
-            Import-Module $modulePath -ErrorAction Stop
-        }
-        else {
-            # Try from Automation Account modules
-            Import-Module LogAnalyticsIngestion -ErrorAction Stop
-        }
-        Write-Output "LogAnalyticsIngestion module loaded successfully"
+# Import FileInventory module (includes Log Analytics ingestion functions)
+try {
+    $scriptPath = $PSScriptRoot
+    if (-not $scriptPath) { $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path }
+    $modulePath = Join-Path (Split-Path -Parent $scriptPath) "modules\FileInventory.psm1"
+    
+    if (Test-Path $modulePath) {
+        Import-Module $modulePath -ErrorAction Stop
+        Write-Output "FileInventory module loaded from: $modulePath"
     }
-    catch {
-        Write-Warning "Failed to import LogAnalyticsIngestion module: $_"
+    else {
+        # Try from Automation Account modules
+        Import-Module FileInventory -ErrorAction Stop
+        Write-Output "FileInventory module loaded from Automation Account"
+    }
+}
+catch {
+    Write-Warning "Failed to import FileInventory module: $_"
+    if ($SendToLogAnalytics) {
         Write-Warning "Log Analytics integration will be skipped"
         $SendToLogAnalytics = $false
     }

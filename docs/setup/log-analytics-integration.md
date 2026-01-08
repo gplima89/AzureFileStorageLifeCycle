@@ -259,10 +259,10 @@ StgFileLifeCycle01_CL
 
 ### Testing the Connection
 
-Run the test function from the LogAnalyticsIngestion module:
+Run the test function from the FileInventory module:
 
 ```powershell
-Import-Module .\src\modules\LogAnalyticsIngestion.psm1
+Import-Module .\src\modules\FileInventory.psm1
 
 Initialize-LogAnalyticsIngestion `
     -DceEndpoint "https://your-dce.region.ingest.monitor.azure.com" `
@@ -285,6 +285,8 @@ StgFileLifeCycle01_CL
 
 ## Module Functions Reference
 
+All Log Analytics functions are now integrated into the `FileInventory.psm1` module:
+
 | Function | Description |
 |----------|-------------|
 | `Initialize-LogAnalyticsIngestion` | Configures DCE, DCR, and stream settings |
@@ -292,6 +294,18 @@ StgFileLifeCycle01_CL
 | `Send-FileInventoryToLogAnalytics` | Sends file inventory with metadata |
 | `Test-LogAnalyticsConnection` | Tests connectivity with a sample record |
 | `Get-LogAnalyticsAccessToken` | Gets OAuth token via Managed Identity |
+| `ConvertTo-LogAnalyticsJson` | Converts data to Log Analytics JSON format |
+
+## Automation Account Setup
+
+With the integrated module, you only need to upload **one module** to your Automation Account:
+
+1. Navigate to your **Automation Account** > **Modules**
+2. Click **+ Add a module**
+3. Upload `FileInventory.psm1` from `src/modules/`
+4. Runtime version: PowerShell 7.2
+
+This single module includes both file inventory and Log Analytics functionality.
 
 ## Your Configuration
 
