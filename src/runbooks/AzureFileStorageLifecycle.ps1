@@ -638,10 +638,11 @@ function Test-FileMatchesConditions {
         }
     }
     
-    # Check created date
+    # Check created date (use FileProperties.SmbProperties.FileCreatedOn in modern Az.Storage)
     if ($Conditions.createdDaysAgo) {
         $thresholdDate = $currentDate.AddDays(-$Conditions.createdDaysAgo)
-        if ($File.Properties.CreatedOn -and $File.Properties.CreatedOn -gt $thresholdDate) {
+        $fileCreatedOn = $File.FileProperties.SmbProperties.FileCreatedOn
+        if ($fileCreatedOn -and $fileCreatedOn -gt $thresholdDate) {
             return $false
         }
     }
@@ -892,6 +893,9 @@ function Get-AllFilesRecursive {
     <#
     .SYNOPSIS
         Recursively gets all files from an Azure File Share
+    .DESCRIPTION
+        Navigates through the file share recursively and returns all file objects.
+        Each file object has a FullPath property added for convenience.
     #>
     [CmdletBinding()]
     param(
@@ -908,17 +912,27 @@ function Get-AllFilesRecursive {
     $files = [System.Collections.Generic.List[object]]::new()
     
     try {
-        $items = Get-AzStorageFile -Context $Context -ShareName $ShareName -Path $Path -ErrorAction Stop
+        # Get items at current path
+        $items = if ([string]::IsNullOrEmpty($Path)) {
+            # Root level - Get-AzStorageFile returns contents directly
+            Get-AzStorageFile -Context $Context -ShareName $ShareName -ErrorAction Stop
+        } else {
+            # Subdirectory - need to get the directory object first, then pipe to get contents
+            Get-AzStorageFile -Context $Context -ShareName $ShareName -Path $Path -ErrorAction Stop | 
+                Get-AzStorageFile -ErrorAction Stop
+        }
         
         foreach ($item in $items) {
-            if ($item.GetType().Name -eq "AzureStorageFileDirectory" -or $item.IsDirectory) {
+            $isDirectory = ($item.GetType().Name -eq "AzureStorageFileDirectory")
+            
+            if ($isDirectory) {
                 # Recursively get files from subdirectory
                 $subPath = if ($Path) { "$Path/$($item.Name)" } else { $item.Name }
                 $subFiles = Get-AllFilesRecursive -Context $Context -ShareName $ShareName -Path $subPath
                 $files.AddRange($subFiles)
             }
             else {
-                # It's a file
+                # It's a file - add FullPath property
                 $filePath = if ($Path) { "$Path/$($item.Name)" } else { $item.Name }
                 $item | Add-Member -NotePropertyName "FullPath" -NotePropertyValue $filePath -Force
                 $files.Add($item)
@@ -936,6 +950,10 @@ function Get-AzureFileHash {
     <#
     .SYNOPSIS
         Calculates MD5 hash for a file in Azure File Share
+    .DESCRIPTION
+        Downloads the file to a temp location and calculates MD5 hash.
+        Azure Files doesn't store ContentHash like Blob Storage, so we always calculate it.
+        For large files, returns SKIPPED_TOO_LARGE to avoid performance issues.
     #>
     [CmdletBinding()]
     param(
@@ -953,33 +971,58 @@ function Get-AzureFileHash {
     )
     
     try {
-        # Get file object
-        $file = Get-AzStorageFile -Context $Context -ShareName $ShareName -Path $FilePath -ErrorAction Stop
+        # Get file object - use directory path to get file listing, then filter
+        $parentPath = [System.IO.Path]::GetDirectoryName($FilePath) -replace '\\', '/'
+        $fileName = [System.IO.Path]::GetFileName($FilePath)
+        
+        # Get file size to check before downloading
+        $file = $null
+        if ([string]::IsNullOrEmpty($parentPath)) {
+            # File is in root
+            $file = Get-AzStorageFile -Context $Context -ShareName $ShareName -ErrorAction Stop | 
+                    Where-Object { $_.Name -eq $fileName -and -not $_.IsDirectory } | 
+                    Select-Object -First 1
+        } else {
+            # File is in a subdirectory - navigate to parent directory first
+            $file = Get-AzStorageFile -Context $Context -ShareName $ShareName -Path $parentPath -ErrorAction Stop | 
+                    Get-AzStorageFile -ErrorAction Stop | 
+                    Where-Object { $_.Name -eq $fileName -and -not $_.IsDirectory } | 
+                    Select-Object -First 1
+        }
+        
+        if (-not $file) {
+            Write-Log "File not found for hash calculation: $FilePath" -Level Warning
+            return "ERROR_NOT_FOUND"
+        }
         
         # Skip hash calculation for very large files to avoid performance issues
-        if ($file.Length -gt $MaxSizeForHash) {
+        $fileLength = if ($file.Length) { $file.Length } elseif ($file.FileProperties.ContentLength) { $file.FileProperties.ContentLength } else { 0 }
+        if ($fileLength -gt $MaxSizeForHash) {
             return "SKIPPED_TOO_LARGE"
         }
         
-        # Get file properties which includes ContentMD5 if set
-        $fileProperties = $file.FetchAttributes()
-        
-        # If ContentMD5 is already set, use it
-        if ($file.Properties.ContentMD5) {
-            return [System.Convert]::ToBase64String([System.Convert]::FromBase64String($file.Properties.ContentMD5))
+        # Check if ContentHash is available (Azure Files may have it in some cases)
+        if ($file.FileProperties -and $file.FileProperties.ContentHash -and $file.FileProperties.ContentHash.Length -gt 0) {
+            return [System.Convert]::ToBase64String($file.FileProperties.ContentHash)
         }
         
-        # Otherwise, download and calculate hash
+        # Download and calculate hash
         $tempFile = [System.IO.Path]::GetTempFileName()
         try {
             Get-AzStorageFileContent -Context $Context -ShareName $ShareName -Path $FilePath -Destination $tempFile -Force -ErrorAction Stop | Out-Null
             
             $md5 = [System.Security.Cryptography.MD5]::Create()
             $stream = [System.IO.File]::OpenRead($tempFile)
-            $hash = [System.BitConverter]::ToString($md5.ComputeHash($stream)).Replace("-", "")
-            $stream.Close()
-            
-            return $hash
+            try {
+                $hashBytes = $md5.ComputeHash($stream)
+                $hash = [System.BitConverter]::ToString($hashBytes).Replace("-", "")
+                return $hash
+            }
+            finally {
+                $stream.Close()
+                $stream.Dispose()
+                $md5.Dispose()
+            }
         }
         finally {
             if (Test-Path $tempFile) {
@@ -1046,7 +1089,7 @@ function Process-FileShare {
             -FilePath $file.FullPath `
             -FileSizeBytes $file.Length `
             -LastModified $file.LastModified `
-            -Created $file.Properties.CreatedOn `
+            -Created $file.FileProperties.SmbProperties.FileCreatedOn `
             -FileHash $fileHash
         
         $script:TotalFilesProcessed++
