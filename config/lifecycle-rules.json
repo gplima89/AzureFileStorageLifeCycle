@@ -69,7 +69,7 @@
                 },
                 {
                     "name": "fileshare2",
-                    "enabled": true,
+                    "enabled": false,
                     "rules": [
                         {
                             "name": "DeleteVeryOldFiles",

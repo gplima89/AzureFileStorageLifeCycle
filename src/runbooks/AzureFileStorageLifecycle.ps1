@@ -929,7 +929,12 @@ function Get-AllFilesRecursive {
                 # Recursively get files from subdirectory
                 $subPath = if ($Path) { "$Path/$($item.Name)" } else { $item.Name }
                 $subFiles = Get-AllFilesRecursive -Context $Context -ShareName $ShareName -Path $subPath
-                $files.AddRange($subFiles)
+                # Ensure subFiles is always an array for AddRange (handles single item returns)
+                if ($subFiles) {
+                    foreach ($subFile in @($subFiles)) {
+                        $files.Add($subFile)
+                    }
+                }
             }
             else {
                 # It's a file - add FullPath property
