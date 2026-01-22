@@ -409,40 +409,152 @@ function Get-AllFilesRecursive {
         [string]$ShareName,
         
         [Parameter(Mandatory = $false)]
-        [string]$Path = ""
+        [string]$Path = "",
+        
+        [Parameter(Mandatory = $false)]
+        [int]$MaxRetries = 3,
+        
+        [Parameter(Mandatory = $false)]
+        [int]$RetryDelaySeconds = 2,
+        
+        [Parameter(Mandatory = $false)]
+        [int]$Depth = 0
     )
     
     $files = [System.Collections.Generic.List[object]]::new()
+    $maxDepth = 50  # Prevent infinite recursion
     
-    try {
-        $items = if ([string]::IsNullOrEmpty($Path)) {
-            Get-AzStorageFile -Context $Context -ShareName $ShareName -ErrorAction Stop
-        } else {
-            Get-AzStorageFile -Context $Context -ShareName $ShareName -Path $Path -ErrorAction Stop | 
-                Get-AzStorageFile -ErrorAction Stop
-        }
-        
-        foreach ($item in $items) {
-            $isDirectory = ($item.GetType().Name -eq "AzureStorageFileDirectory")
+    if ($Depth -gt $maxDepth) {
+        Write-Log "Maximum directory depth ($maxDepth) reached at path '$Path'. Skipping." -Level Warning
+        return $files
+    }
+    
+    # Retry logic for listing directory contents
+    $retryCount = 0
+    $items = $null
+    $success = $false
+    
+    while (-not $success -and $retryCount -lt $MaxRetries) {
+        try {
+            $retryCount++
             
-            if ($isDirectory) {
-                $subPath = if ($Path) { "$Path/$($item.Name)" } else { $item.Name }
-                $subFiles = Get-AllFilesRecursive -Context $Context -ShareName $ShareName -Path $subPath
-                if ($subFiles) {
-                    foreach ($subFile in @($subFiles)) {
-                        $files.Add($subFile)
-                    }
+            if ([string]::IsNullOrEmpty($Path)) {
+                # List root of file share
+                $items = Get-AzStorageFile -Context $Context -ShareName $ShareName -ErrorAction Stop
+            } 
+            else {
+                # List contents of a subdirectory - use direct path approach to avoid duplication
+                $directory = Get-AzStorageFile -Context $Context -ShareName $ShareName -Path $Path -ErrorAction Stop
+                
+                if ($null -eq $directory) {
+                    Write-Log "Directory not found: '$Path'" -Level Warning
+                    return $files
                 }
+                
+                # Check if it's actually a directory
+                $isDir = $directory.GetType().Name -match 'Directory' -or 
+                         ($directory.PSObject.Properties['IsDirectory'] -and $directory.IsDirectory) -or
+                         (-not $directory.PSObject.Properties['Length'])
+                
+                if (-not $isDir) {
+                    Write-Log "Path '$Path' is not a directory, skipping" -Level Warning
+                    return $files
+                }
+                
+                # Get contents of the directory
+                $items = $directory | Get-AzStorageFile -ErrorAction Stop
+            }
+            
+            $success = $true
+        }
+        catch {
+            $errorMessage = $_.Exception.Message
+            $statusCode = if ($_.Exception.Response) { $_.Exception.Response.StatusCode.value__ } else { "N/A" }
+            
+            Write-Log "Error listing directory '$Path' (attempt $retryCount/$MaxRetries): $errorMessage" -Level Warning
+            
+            if ($retryCount -lt $MaxRetries) {
+                # Exponential backoff
+                $delay = $RetryDelaySeconds * [Math]::Pow(2, $retryCount - 1)
+                Write-Log "Retrying in $delay seconds..." -Level Information
+                Start-Sleep -Seconds $delay
             }
             else {
-                $filePath = if ($Path) { "$Path/$($item.Name)" } else { $item.Name }
-                $item | Add-Member -NotePropertyName "FullPath" -NotePropertyValue $filePath -Force
-                $files.Add($item)
+                Write-Log "Failed to list directory '$Path' after $MaxRetries attempts. Skipping." -Level Warning
+                return $files
             }
         }
     }
-    catch {
-        Write-Log "Error listing files in path '$Path': $_" -Level Warning
+    
+    if ($null -eq $items) {
+        return $files
+    }
+    
+    # Process items
+    $itemCount = 0
+    foreach ($item in $items) {
+        $itemCount++
+        
+        # Throttle for large directories to avoid rate limiting
+        if ($itemCount % 1000 -eq 0) {
+            Write-Log "Processed $itemCount items in directory '$Path'..." -Level Information
+            Start-Sleep -Milliseconds 100  # Small delay to avoid throttling
+        }
+        
+        # Determine if item is a directory using multiple detection methods
+        $itemName = $item.Name
+        $isDirectory = $false
+        
+        # Method 1: Check type name
+        if ($item.GetType().Name -match 'Directory') {
+            $isDirectory = $true
+        }
+        # Method 2: Check IsDirectory property
+        elseif ($item.PSObject.Properties['IsDirectory'] -and $item.IsDirectory) {
+            $isDirectory = $true
+        }
+        # Method 3: Check for absence of Length property (directories don't have size)
+        elseif (-not $item.PSObject.Properties['Length'] -and -not $item.PSObject.Properties['ContentLength']) {
+            $isDirectory = $true
+        }
+        # Method 4: Check CloudFile vs CloudFileDirectory
+        elseif ($item.GetType().FullName -like '*CloudFileDirectory*') {
+            $isDirectory = $true
+        }
+        
+        if ($isDirectory) {
+            # Construct subdirectory path - ensure we use only the item name, not any path prefix
+            $cleanName = $itemName.TrimStart('/').Split('/')[-1]  # Get just the directory name
+            $subPath = if ([string]::IsNullOrEmpty($Path)) { $cleanName } else { "$Path/$cleanName" }
+            
+            # Prevent path duplication by checking if path already ends with the name
+            if ($Path -and $Path.EndsWith("/$cleanName")) {
+                Write-Log "Skipping duplicate path: '$subPath' (already processed)" -Level Warning
+                continue
+            }
+            
+            # Recursive call with increased depth
+            $subFiles = Get-AllFilesRecursive -Context $Context -ShareName $ShareName -Path $subPath -MaxRetries $MaxRetries -RetryDelaySeconds $RetryDelaySeconds -Depth ($Depth + 1)
+            
+            if ($subFiles -and $subFiles.Count -gt 0) {
+                foreach ($subFile in @($subFiles)) {
+                    $files.Add($subFile)
+                }
+            }
+        }
+        else {
+            # It's a file - construct full path
+            $cleanName = $itemName.TrimStart('/').Split('/')[-1]  # Get just the file name
+            $filePath = if ([string]::IsNullOrEmpty($Path)) { $cleanName } else { "$Path/$cleanName" }
+            
+            $item | Add-Member -NotePropertyName "FullPath" -NotePropertyValue $filePath -Force
+            $files.Add($item)
+        }
+    }
+    
+    # Log progress for directories with many items
+    if ($itemCount -gt 100) {
+        Write-Log "Completed directory '$Path': $itemCount items found, $($files.Count) files collected" -Level Information
     }
     
     return $files
