@@ -101,6 +101,9 @@ param(
     [int]$MaxFileSizeForHashMB = 100,
     
     [Parameter(Mandatory = $false)]
+    [switch]$SkipHashComputation,
+    
+    [Parameter(Mandatory = $false)]
     [switch]$DryRun
 )
 
@@ -167,13 +170,12 @@ $script:TotalBytesProcessed = 0
 $script:TotalFilesSentToLA = 0
 $script:BatchesSent = 0
 
-# Lightweight hash tracking for duplicates (hash -> list of file paths)
-# Using Dictionary for memory efficiency
-$script:FileHashIndex = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[string]]]::new()
+# Batch processing settings - optimized for Azure Automation sandbox (~400MB limit)
+$script:BatchSize = 200  # Reduced batch size for memory efficiency
+$script:SkipHashing = $false  # Will be set based on parameter
 
-# Batch processing settings
-$script:BatchSize = 500  # Send to LA every 500 files
-$script:MaxMemoryMB = 1500  # Force flush if memory exceeds this (leave headroom)
+# Note: Hash tracking disabled by default for large shares due to Azure Automation memory limits
+# Use SkipHashComputation parameter or run on Hybrid Worker for full duplicate detection
 #endregion
 
 #region Helper Functions
@@ -566,12 +568,15 @@ function Get-AllFilesRecursive {
                 continue
             }
             
-            # Calculate hash for duplicate detection
-            $fileHash = Get-AzureFileHash `
-                -Context $Context `
-                -ShareName $ShareName `
-                -FilePath $filePath `
-                -MaxSizeForHash $MaxSizeForHash
+            # Calculate hash for duplicate detection (unless skipped for performance)
+            $fileHash = "SKIPPED"
+            if (-not $script:SkipHashing) {
+                $fileHash = Get-AzureFileHash `
+                    -Context $Context `
+                    -ShareName $ShareName `
+                    -FilePath $filePath `
+                    -MaxSizeForHash $MaxSizeForHash
+            }
             
             # Add to inventory batch
             Add-FileInventoryEntry `
@@ -588,9 +593,12 @@ function Get-AllFilesRecursive {
             # Send batch to Log Analytics if threshold reached
             Send-BatchToLogAnalyticsIfNeeded
             
-            # Progress logging
-            if ($script:TotalFilesProcessed % 500 -eq 0) {
+            # Progress logging - every 200 files for smaller batches
+            if ($script:TotalFilesProcessed % 200 -eq 0) {
                 Write-Log "Progress: $($script:TotalFilesProcessed) files processed, $($script:TotalFilesSentToLA) sent to LA, $([math]::Round($script:TotalBytesProcessed / 1GB, 2)) GB scanned" -Level Information
+                
+                # Aggressive garbage collection every batch
+                [System.GC]::Collect()
             }
         }
     }
@@ -726,21 +734,10 @@ function Add-FileInventoryEntry {
     $lastModifiedDT = if ($LastModified -is [DateTimeOffset]) { $LastModified.DateTime } elseif ($LastModified) { [datetime]$LastModified } else { $null }
     $createdDT = if ($Created -is [DateTimeOffset]) { $Created.DateTime } elseif ($Created) { [datetime]$Created } else { $null }
     
-    # Track hash for duplicate detection (lightweight - only store path reference)
-    $isDuplicate = "No"
+    # Duplicate detection disabled for Azure Automation sandbox memory constraints
+    # Duplicates can be detected later via Log Analytics queries on FileHash column
+    $isDuplicate = "Unknown"
     $duplicateCount = 0
-    
-    if ($FileHash -and $FileHash -notin @("SKIPPED_TOO_LARGE", "ERROR", "ERROR_NOT_FOUND")) {
-        if ($script:FileHashIndex.ContainsKey($FileHash)) {
-            $script:FileHashIndex[$FileHash].Add($FilePath)
-            $isDuplicate = "Yes"
-            $duplicateCount = $script:FileHashIndex[$FileHash].Count
-        }
-        else {
-            $script:FileHashIndex[$FileHash] = [System.Collections.Generic.List[string]]::new()
-            $script:FileHashIndex[$FileHash].Add($FilePath)
-        }
-    }
     
     $fileExtensionValue = if ($FileExtension) { $FileExtension } else { [System.IO.Path]::GetExtension($FilePath) }
     $ageInDays = if ($lastModifiedDT) { [math]::Round((Get-Date).Subtract($lastModifiedDT).TotalDays, 0) } else { $null }
@@ -760,7 +757,7 @@ function Add-FileInventoryEntry {
         FileHash          = $FileHash
         IsDuplicate       = $isDuplicate
         DuplicateCount    = $duplicateCount
-        DuplicateGroupId  = if ($isDuplicate -eq "Yes") { $FileHash.Substring(0, [Math]::Min(8, $FileHash.Length)) } else { "" }
+        DuplicateGroupId  = ""
         FileCategory      = Get-FileCategory -Extension $fileExtensionValue
         AgeBucket         = Get-AgeBucket -AgeInDays $ageInDays
         SizeBucket        = Get-SizeBucket -SizeBytes $FileSizeBytes
@@ -781,23 +778,8 @@ function Send-BatchToLogAnalyticsIfNeeded {
         [switch]$Force
     )
     
-    # Check if we should send batch
+    # Check if we should send batch - use smaller threshold for Azure Automation
     $shouldSend = $Force -or ($script:FileInventoryBatch.Count -ge $script:BatchSize)
-    
-    # Also check memory pressure
-    if (-not $shouldSend) {
-        try {
-            $process = Get-Process -Id $PID
-            $memoryMB = [math]::Round($process.WorkingSet64 / 1MB, 0)
-            if ($memoryMB -gt $script:MaxMemoryMB) {
-                Write-Log "Memory pressure detected ($memoryMB MB). Forcing batch send." -Level Warning
-                $shouldSend = $true
-            }
-        }
-        catch {
-            # Ignore memory check errors
-        }
-    }
     
     if (-not $shouldSend -or $script:FileInventoryBatch.Count -eq 0) {
         return
@@ -821,12 +803,13 @@ function Send-BatchToLogAnalyticsIfNeeded {
         Write-Log "Error sending batch to Log Analytics: $_" -Level Warning
     }
     
-    # Clear batch to free memory
+    # Clear batch to free memory immediately
     $script:FileInventoryBatch.Clear()
     
-    # Force garbage collection to reclaim memory
+    # Force garbage collection to reclaim memory - critical for Azure Automation sandbox
     [System.GC]::Collect()
     [System.GC]::WaitForPendingFinalizers()
+    [System.GC]::Collect()
 }
 
 function Get-FileCategory {
@@ -902,6 +885,15 @@ try {
     Write-Log "Execution ID: $script:ExecutionId" -Level Information
     Write-Log "Mode: Streaming (batch size: $script:BatchSize)" -Level Information
     
+    # Set hash computation mode
+    $script:SkipHashing = $SkipHashComputation.IsPresent
+    if ($script:SkipHashing) {
+        Write-Log "Hash computation: DISABLED (use -SkipHashComputation:$false to enable)" -Level Warning
+    }
+    else {
+        Write-Log "Hash computation: ENABLED (use -SkipHashComputation to disable for large shares)" -Level Information
+    }
+    
     if ($DryRun) {
         Write-Log "*** DRY RUN MODE - Data will still be sent to Log Analytics ***" -Level Warning
     }
@@ -965,6 +957,10 @@ try {
             -ExcludePatterns $script:ExcludePatterns
         
         Write-Log "File share '$shareName' complete: $filesInShare files processed" -Level Information
+        
+        # Force GC after each file share
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
     }
     
     # Send any remaining records in the batch
@@ -972,11 +968,6 @@ try {
         Write-Log "Sending final batch of $($script:FileInventoryBatch.Count) records..." -Level Information
         Send-BatchToLogAnalyticsIfNeeded -Force
     }
-    
-    # Calculate duplicate statistics from hash index
-    $duplicateGroups = $script:FileHashIndex.GetEnumerator() | Where-Object { $_.Value.Count -gt 1 }
-    $totalDuplicateGroups = ($duplicateGroups | Measure-Object).Count
-    $totalDuplicateFiles = ($duplicateGroups | ForEach-Object { $_.Value.Count } | Measure-Object -Sum).Sum
     
     # Execution summary
     $executionTime = (Get-Date) - $script:ExecutionStartTime
@@ -991,18 +982,11 @@ try {
     Write-Log "Total files sent to Log Analytics: $($script:TotalFilesSentToLA)" -Level Information
     Write-Log "Total batches sent: $($script:BatchesSent)" -Level Information
     Write-Log "Total data scanned: $([math]::Round($script:TotalBytesProcessed / 1GB, 2)) GB" -Level Information
-    Write-Log "Duplicate groups found: $totalDuplicateGroups" -Level Information
-    
-    if ($totalDuplicateGroups -gt 0) {
-        Write-Log "Total duplicate files: $totalDuplicateFiles" -Level Warning
-    }
-    
-    # Clear hash index to free memory
-    $script:FileHashIndex.Clear()
-    [System.GC]::Collect()
+    Write-Log "Hash computation: $(if ($script:SkipHashing) { 'Skipped' } else { 'Enabled' })" -Level Information
     
     Write-Log "========================================" -Level Information
     Write-Log "Azure File Storage Inventory Scanner completed successfully" -Level Information
+    Write-Log "NOTE: To find duplicates, query Log Analytics: StgFileLifeCycle01_CL | where FileHash != 'SKIPPED' | summarize count() by FileHash | where count_ > 1" -Level Information
 }
 catch {
     Write-Log "Fatal error during execution: $_" -Level Error
