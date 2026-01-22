@@ -101,10 +101,10 @@ param(
     [int]$MaxFileSizeForHashMB = 100,
     
     [Parameter(Mandatory = $false)]
-    [switch]$SkipHashComputation,
+    [bool]$SkipHashComputation = $false,
     
     [Parameter(Mandatory = $false)]
-    [switch]$DryRun
+    [bool]$DryRun = $false
 )
 
 #region Module Imports
@@ -886,12 +886,12 @@ try {
     Write-Log "Mode: Streaming (batch size: $script:BatchSize)" -Level Information
     
     # Set hash computation mode
-    $script:SkipHashing = $SkipHashComputation.IsPresent
+    $script:SkipHashing = $SkipHashComputation
     if ($script:SkipHashing) {
-        Write-Log "Hash computation: DISABLED (use -SkipHashComputation:$false to enable)" -Level Warning
+        Write-Log "Hash computation: DISABLED (set SkipHashComputation to `$false to enable)" -Level Warning
     }
     else {
-        Write-Log "Hash computation: ENABLED (use -SkipHashComputation to disable for large shares)" -Level Information
+        Write-Log "Hash computation: ENABLED (set SkipHashComputation to `$true to disable for large shares)" -Level Information
     }
     
     if ($DryRun) {
