@@ -196,7 +196,7 @@ function Write-Log {
     
     switch ($Level) {
         "Debug" { Write-Verbose $logMessage }
-        "Information" { Write-Output $logMessage }
+        "Information" { Write-Host $logMessage }
         "Warning" { Write-Warning $logMessage }
         "Error" { Write-Error $logMessage }
     }
