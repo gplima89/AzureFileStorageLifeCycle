@@ -159,11 +159,21 @@ $script:ExcludePatterns = $excludePatternsStr -split ',' | ForEach-Object { $_.T
 #endregion
 
 #region Global Variables
-$script:FileInventory = [System.Collections.Generic.List[PSCustomObject]]::new()
+$script:FileInventoryBatch = [System.Collections.Generic.List[PSCustomObject]]::new()
 $script:ExecutionStartTime = Get-Date
 $script:ExecutionId = [guid]::NewGuid().ToString()
 $script:TotalFilesProcessed = 0
 $script:TotalBytesProcessed = 0
+$script:TotalFilesSentToLA = 0
+$script:BatchesSent = 0
+
+# Lightweight hash tracking for duplicates (hash -> list of file paths)
+# Using Dictionary for memory efficiency
+$script:FileHashIndex = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[string]]]::new()
+
+# Batch processing settings
+$script:BatchSize = 500  # Send to LA every 500 files
+$script:MaxMemoryMB = 1500  # Force flush if memory exceeds this (leave headroom)
 #endregion
 
 #region Helper Functions
@@ -408,8 +418,17 @@ function Get-AllFilesRecursive {
         [Parameter(Mandatory = $true)]
         [string]$ShareName,
         
+        [Parameter(Mandatory = $true)]
+        [string]$StorageAccountName,
+        
         [Parameter(Mandatory = $false)]
         [string]$Path = "",
+        
+        [Parameter(Mandatory = $false)]
+        [long]$MaxSizeForHash = 100MB,
+        
+        [Parameter(Mandatory = $false)]
+        [string[]]$ExcludePatterns = @(),
         
         [Parameter(Mandatory = $false)]
         [int]$MaxRetries = 3,
@@ -421,12 +440,12 @@ function Get-AllFilesRecursive {
         [int]$Depth = 0
     )
     
-    $files = [System.Collections.Generic.List[object]]::new()
+    $filesProcessedInDir = 0
     $maxDepth = 50  # Prevent infinite recursion
     
     if ($Depth -gt $maxDepth) {
         Write-Log "Maximum directory depth ($maxDepth) reached at path '$Path'. Skipping." -Level Warning
-        return $files
+        return $filesProcessedInDir
     }
     
     # Retry logic for listing directory contents
@@ -448,7 +467,7 @@ function Get-AllFilesRecursive {
                 
                 if ($null -eq $directory) {
                     Write-Log "Directory not found: '$Path'" -Level Warning
-                    return $files
+                    return $filesProcessedInDir
                 }
                 
                 # Check if it's actually a directory
@@ -458,7 +477,7 @@ function Get-AllFilesRecursive {
                 
                 if (-not $isDir) {
                     Write-Log "Path '$Path' is not a directory, skipping" -Level Warning
-                    return $files
+                    return $filesProcessedInDir
                 }
                 
                 # Get contents of the directory
@@ -481,16 +500,16 @@ function Get-AllFilesRecursive {
             }
             else {
                 Write-Log "Failed to list directory '$Path' after $MaxRetries attempts. Skipping." -Level Warning
-                return $files
+                return $filesProcessedInDir
             }
         }
     }
     
     if ($null -eq $items) {
-        return $files
+        return $filesProcessedInDir
     }
     
-    # Process items
+    # Process items - stream files directly to inventory
     $itemCount = 0
     foreach ($item in $items) {
         $itemCount++
@@ -533,31 +552,55 @@ function Get-AllFilesRecursive {
                 continue
             }
             
-            # Recursive call with increased depth
-            $subFiles = Get-AllFilesRecursive -Context $Context -ShareName $ShareName -Path $subPath -MaxRetries $MaxRetries -RetryDelaySeconds $RetryDelaySeconds -Depth ($Depth + 1)
-            
-            if ($subFiles -and $subFiles.Count -gt 0) {
-                foreach ($subFile in @($subFiles)) {
-                    $files.Add($subFile)
-                }
-            }
+            # Recursive call with increased depth - files are processed inline
+            $subFilesCount = Get-AllFilesRecursive -Context $Context -ShareName $ShareName -StorageAccountName $StorageAccountName -Path $subPath -MaxSizeForHash $MaxSizeForHash -ExcludePatterns $ExcludePatterns -MaxRetries $MaxRetries -RetryDelaySeconds $RetryDelaySeconds -Depth ($Depth + 1)
+            $filesProcessedInDir += $subFilesCount
         }
         else {
-            # It's a file - construct full path
+            # It's a file - process immediately instead of collecting
             $cleanName = $itemName.TrimStart('/').Split('/')[-1]  # Get just the file name
             $filePath = if ([string]::IsNullOrEmpty($Path)) { $cleanName } else { "$Path/$cleanName" }
             
-            $item | Add-Member -NotePropertyName "FullPath" -NotePropertyValue $filePath -Force
-            $files.Add($item)
+            # Check exclusion patterns
+            if (Test-FileExcluded -FileName $cleanName -ExcludePatterns $ExcludePatterns) {
+                continue
+            }
+            
+            # Calculate hash for duplicate detection
+            $fileHash = Get-AzureFileHash `
+                -Context $Context `
+                -ShareName $ShareName `
+                -FilePath $filePath `
+                -MaxSizeForHash $MaxSizeForHash
+            
+            # Add to inventory batch
+            Add-FileInventoryEntry `
+                -StorageAccount $StorageAccountName `
+                -FileShare $ShareName `
+                -FilePath $filePath `
+                -FileSizeBytes $item.Length `
+                -LastModified $item.LastModified `
+                -Created $item.FileProperties.SmbProperties.FileCreatedOn `
+                -FileHash $fileHash
+            
+            $filesProcessedInDir++
+            
+            # Send batch to Log Analytics if threshold reached
+            Send-BatchToLogAnalyticsIfNeeded
+            
+            # Progress logging
+            if ($script:TotalFilesProcessed % 500 -eq 0) {
+                Write-Log "Progress: $($script:TotalFilesProcessed) files processed, $($script:TotalFilesSentToLA) sent to LA, $([math]::Round($script:TotalBytesProcessed / 1GB, 2)) GB scanned" -Level Information
+            }
         }
     }
     
     # Log progress for directories with many items
     if ($itemCount -gt 100) {
-        Write-Log "Completed directory '$Path': $itemCount items found, $($files.Count) files collected" -Level Information
+        Write-Log "Completed directory '$Path': $itemCount items, $filesProcessedInDir files processed" -Level Information
     }
     
-    return $files
+    return $filesProcessedInDir
 }
 
 function Get-AzureFileHash {
@@ -683,87 +726,107 @@ function Add-FileInventoryEntry {
     $lastModifiedDT = if ($LastModified -is [DateTimeOffset]) { $LastModified.DateTime } elseif ($LastModified) { [datetime]$LastModified } else { $null }
     $createdDT = if ($Created -is [DateTimeOffset]) { $Created.DateTime } elseif ($Created) { [datetime]$Created } else { $null }
     
+    # Track hash for duplicate detection (lightweight - only store path reference)
+    $isDuplicate = "No"
+    $duplicateCount = 0
+    
+    if ($FileHash -and $FileHash -notin @("SKIPPED_TOO_LARGE", "ERROR", "ERROR_NOT_FOUND")) {
+        if ($script:FileHashIndex.ContainsKey($FileHash)) {
+            $script:FileHashIndex[$FileHash].Add($FilePath)
+            $isDuplicate = "Yes"
+            $duplicateCount = $script:FileHashIndex[$FileHash].Count
+        }
+        else {
+            $script:FileHashIndex[$FileHash] = [System.Collections.Generic.List[string]]::new()
+            $script:FileHashIndex[$FileHash].Add($FilePath)
+        }
+    }
+    
+    $fileExtensionValue = if ($FileExtension) { $FileExtension } else { [System.IO.Path]::GetExtension($FilePath) }
+    $ageInDays = if ($lastModifiedDT) { [math]::Round((Get-Date).Subtract($lastModifiedDT).TotalDays, 0) } else { $null }
+    
     $entry = [PSCustomObject]@{
         StorageAccount    = $StorageAccount
         FileShare         = $FileShare
         FilePath          = $FilePath
         FileName          = [System.IO.Path]::GetFileName($FilePath)
-        FileExtension     = if ($FileExtension) { $FileExtension } else { [System.IO.Path]::GetExtension($FilePath) }
+        FileExtension     = $fileExtensionValue
         FileSizeBytes     = $FileSizeBytes
         FileSizeMB        = [math]::Round($FileSizeBytes / 1MB, 2)
         FileSizeGB        = [math]::Round($FileSizeBytes / 1GB, 4)
         LastModified      = $lastModifiedDT
         Created           = $createdDT
-        AgeInDays         = if ($lastModifiedDT) { [math]::Round((Get-Date).Subtract($lastModifiedDT).TotalDays, 0) } else { $null }
+        AgeInDays         = $ageInDays
         FileHash          = $FileHash
-        IsDuplicate       = "No"
-        DuplicateCount    = 0
-        DuplicateGroupId  = ""
+        IsDuplicate       = $isDuplicate
+        DuplicateCount    = $duplicateCount
+        DuplicateGroupId  = if ($isDuplicate -eq "Yes") { $FileHash.Substring(0, [Math]::Min(8, $FileHash.Length)) } else { "" }
+        FileCategory      = Get-FileCategory -Extension $fileExtensionValue
+        AgeBucket         = Get-AgeBucket -AgeInDays $ageInDays
+        SizeBucket        = Get-SizeBucket -SizeBytes $FileSizeBytes
         ScanTimestamp     = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         ExecutionId       = $script:ExecutionId
+        TimeGenerated     = (Get-Date).ToUniversalTime()
     }
     
-    $script:FileInventory.Add($entry)
+    $script:FileInventoryBatch.Add($entry)
+    $script:TotalFilesProcessed++
+    $script:TotalBytesProcessed += $FileSizeBytes
 }
 
-function Find-DuplicateFiles {
+function Send-BatchToLogAnalyticsIfNeeded {
     [CmdletBinding()]
-    param()
+    param(
+        [Parameter(Mandatory = $false)]
+        [switch]$Force
+    )
     
-    Write-Log "Analyzing files for duplicates..." -Level Information
-    $duplicateGroups = @{}
+    # Check if we should send batch
+    $shouldSend = $Force -or ($script:FileInventoryBatch.Count -ge $script:BatchSize)
     
-    # Group files by size first (quick pre-filter)
-    $filesBySize = $script:FileInventory | Group-Object -Property FileSizeBytes | Where-Object { $_.Count -gt 1 }
-    
-    if ($filesBySize.Count -gt 0) {
-        Write-Log "Found $($filesBySize.Count) size groups with potential duplicates" -Level Information
-        
-        foreach ($sizeGroup in $filesBySize) {
-            $filesInGroup = $sizeGroup.Group
-            
-            # Group by hash within this size group
-            $hashGroups = $filesInGroup | 
-                Where-Object { $_.FileHash -and $_.FileHash -ne "SKIPPED_TOO_LARGE" -and $_.FileHash -ne "ERROR" -and $_.FileHash -ne "ERROR_NOT_FOUND" } | 
-                Group-Object -Property FileHash | 
-                Where-Object { $_.Count -gt 1 }
-            
-            foreach ($hashGroup in $hashGroups) {
-                $hash = $hashGroup.Name
-                $duplicates = $hashGroup.Group
-                
-                if ($duplicates.Count -gt 1) {
-                    $groupId = [guid]::NewGuid().ToString().Substring(0, 8)
-                    $duplicateGroups[$hash] = @{
-                        GroupId = $groupId
-                        Files = $duplicates
-                        Count = $duplicates.Count
-                        FileSize = $duplicates[0].FileSizeBytes
-                        WastedSpace = $duplicates[0].FileSizeBytes * ($duplicates.Count - 1)
-                    }
-                    
-                    # Update inventory entries
-                    foreach ($file in $duplicates) {
-                        $file.IsDuplicate = "Yes"
-                        $file.DuplicateCount = $duplicates.Count
-                        $file.DuplicateGroupId = $groupId
-                    }
-                }
+    # Also check memory pressure
+    if (-not $shouldSend) {
+        try {
+            $process = Get-Process -Id $PID
+            $memoryMB = [math]::Round($process.WorkingSet64 / 1MB, 0)
+            if ($memoryMB -gt $script:MaxMemoryMB) {
+                Write-Log "Memory pressure detected ($memoryMB MB). Forcing batch send." -Level Warning
+                $shouldSend = $true
             }
         }
-        
-        $totalDuplicateGroups = $duplicateGroups.Count
-        $totalDuplicateFiles = ($duplicateGroups.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
-        $totalWastedSpace = ($duplicateGroups.Values | ForEach-Object { $_.WastedSpace } | Measure-Object -Sum).Sum
-        
-        Write-Log "Found $totalDuplicateGroups groups of duplicate files" -Level Information
-        Write-Log "Total duplicate files: $totalDuplicateFiles (wasting $([math]::Round($totalWastedSpace / 1GB, 2)) GB)" -Level Warning
-    }
-    else {
-        Write-Log "No potential duplicates found (no files with same size)" -Level Information
+        catch {
+            # Ignore memory check errors
+        }
     }
     
-    return $duplicateGroups
+    if (-not $shouldSend -or $script:FileInventoryBatch.Count -eq 0) {
+        return
+    }
+    
+    Write-Log "Sending batch of $($script:FileInventoryBatch.Count) records to Log Analytics (Total sent so far: $script:TotalFilesSentToLA)..." -Level Information
+    
+    try {
+        $laResult = $script:FileInventoryBatch.ToArray() | Send-ToLogAnalytics -DataType "FileInventory"
+        
+        if ($laResult.Success) {
+            $script:TotalFilesSentToLA += $laResult.RecordsSent
+            $script:BatchesSent++
+            Write-Log "Batch sent successfully. Total records sent: $script:TotalFilesSentToLA" -Level Information
+        }
+        else {
+            Write-Log "Batch send had failures: $($laResult.Message)" -Level Warning
+        }
+    }
+    catch {
+        Write-Log "Error sending batch to Log Analytics: $_" -Level Warning
+    }
+    
+    # Clear batch to free memory
+    $script:FileInventoryBatch.Clear()
+    
+    # Force garbage collection to reclaim memory
+    [System.GC]::Collect()
+    [System.GC]::WaitForPendingFinalizers()
 }
 
 function Get-FileCategory {
@@ -837,6 +900,7 @@ try {
     Write-Log "Resource Group: $StorageAccountResourceGroup" -Level Information
     Write-Log "Subscription: $SubscriptionId" -Level Information
     Write-Log "Execution ID: $script:ExecutionId" -Level Information
+    Write-Log "Mode: Streaming (batch size: $script:BatchSize)" -Level Information
     
     if ($DryRun) {
         Write-Log "*** DRY RUN MODE - Data will still be sent to Log Analytics ***" -Level Warning
@@ -886,86 +950,33 @@ try {
     
     $maxSizeForHash = $MaxFileSizeForHashMB * 1MB
     
-    # Process each file share
+    # Process each file share using streaming approach
     foreach ($shareName in $fileSharestoScan) {
         Write-Log "----------------------------------------" -Level Information
         Write-Log "Processing file share: $shareName" -Level Information
+        Write-Log "Scanning and processing files (streaming mode)..." -Level Information
         
-        # Get all files recursively
-        Write-Log "Scanning files in share: $shareName" -Level Information
-        $allFiles = Get-AllFilesRecursive -Context $storageContext -ShareName $shareName
-        Write-Log "Found $($allFiles.Count) files in share: $shareName" -Level Information
+        # Get all files recursively - this now processes files inline and sends batches to LA
+        $filesInShare = Get-AllFilesRecursive `
+            -Context $storageContext `
+            -ShareName $shareName `
+            -StorageAccountName $StorageAccountName `
+            -MaxSizeForHash $maxSizeForHash `
+            -ExcludePatterns $script:ExcludePatterns
         
-        # Calculate file hashes and add to inventory
-        Write-Log "Calculating file hashes and building inventory..." -Level Information
-        $processedCount = 0
-        $skippedCount = 0
-        
-        foreach ($file in $allFiles) {
-            $processedCount++
-            
-            # Check exclusion patterns
-            if (Test-FileExcluded -FileName $file.Name -ExcludePatterns $script:ExcludePatterns) {
-                $skippedCount++
-                continue
-            }
-            
-            if ($processedCount % 100 -eq 0) {
-                Write-Log "Processed $processedCount of $($allFiles.Count) files..." -Level Information
-            }
-            
-            # Calculate hash for duplicate detection
-            $fileHash = Get-AzureFileHash `
-                -Context $storageContext `
-                -ShareName $shareName `
-                -FilePath $file.FullPath `
-                -MaxSizeForHash $maxSizeForHash
-            
-            Add-FileInventoryEntry `
-                -StorageAccount $StorageAccountName `
-                -FileShare $shareName `
-                -FilePath $file.FullPath `
-                -FileSizeBytes $file.Length `
-                -LastModified $file.LastModified `
-                -Created $file.FileProperties.SmbProperties.FileCreatedOn `
-                -FileHash $fileHash
-            
-            $script:TotalFilesProcessed++
-            $script:TotalBytesProcessed += $file.Length
-        }
-        
-        Write-Log "File share '$shareName' complete: $processedCount files processed, $skippedCount skipped" -Level Information
+        Write-Log "File share '$shareName' complete: $filesInShare files processed" -Level Information
     }
     
-    # Find duplicate files
-    $duplicateGroups = Find-DuplicateFiles
-    
-    # Enrich inventory with categories and buckets
-    Write-Log "Enriching inventory data with categories..." -Level Information
-    foreach ($item in $script:FileInventory) {
-        $item | Add-Member -NotePropertyName "FileCategory" -NotePropertyValue (Get-FileCategory -Extension $item.FileExtension) -Force
-        $item | Add-Member -NotePropertyName "AgeBucket" -NotePropertyValue (Get-AgeBucket -AgeInDays $item.AgeInDays) -Force
-        $item | Add-Member -NotePropertyName "SizeBucket" -NotePropertyValue (Get-SizeBucket -SizeBytes $item.FileSizeBytes) -Force
-        $item | Add-Member -NotePropertyName "TimeGenerated" -NotePropertyValue (Get-Date).ToUniversalTime() -Force
+    # Send any remaining records in the batch
+    if ($script:FileInventoryBatch.Count -gt 0) {
+        Write-Log "Sending final batch of $($script:FileInventoryBatch.Count) records..." -Level Information
+        Send-BatchToLogAnalyticsIfNeeded -Force
     }
     
-    # Send to Log Analytics
-    if ($script:FileInventory.Count -gt 0) {
-        Write-Log "Sending $($script:FileInventory.Count) records to Log Analytics..." -Level Information
-        
-        $laResult = $script:FileInventory | Send-ToLogAnalytics -DataType "FileInventory"
-        
-        if ($laResult.Success) {
-            Write-Log "Successfully sent $($laResult.RecordsSent) records to Log Analytics table '$($laResult.TableName)'" -Level Information
-            Write-Log "  Duration: $($laResult.DurationSeconds) seconds, Batches: $($laResult.BatchesSent)/$($laResult.TotalBatches)" -Level Information
-        }
-        else {
-            Write-Log "Failed to send some records to Log Analytics: $($laResult.Message)" -Level Warning
-        }
-    }
-    else {
-        Write-Log "No files found to inventory" -Level Warning
-    }
+    # Calculate duplicate statistics from hash index
+    $duplicateGroups = $script:FileHashIndex.GetEnumerator() | Where-Object { $_.Value.Count -gt 1 }
+    $totalDuplicateGroups = ($duplicateGroups | Measure-Object).Count
+    $totalDuplicateFiles = ($duplicateGroups | ForEach-Object { $_.Value.Count } | Measure-Object -Sum).Sum
     
     # Execution summary
     $executionTime = (Get-Date) - $script:ExecutionStartTime
@@ -976,14 +987,19 @@ try {
     Write-Log "Storage Account: $StorageAccountName" -Level Information
     Write-Log "File Shares Scanned: $($fileSharestoScan.Count)" -Level Information
     Write-Log "Total execution time: $($executionTime.ToString('hh\:mm\:ss'))" -Level Information
-    Write-Log "Total files inventoried: $($script:TotalFilesProcessed)" -Level Information
+    Write-Log "Total files processed: $($script:TotalFilesProcessed)" -Level Information
+    Write-Log "Total files sent to Log Analytics: $($script:TotalFilesSentToLA)" -Level Information
+    Write-Log "Total batches sent: $($script:BatchesSent)" -Level Information
     Write-Log "Total data scanned: $([math]::Round($script:TotalBytesProcessed / 1GB, 2)) GB" -Level Information
-    Write-Log "Duplicate groups found: $($duplicateGroups.Count)" -Level Information
+    Write-Log "Duplicate groups found: $totalDuplicateGroups" -Level Information
     
-    if ($duplicateGroups.Count -gt 0) {
-        $totalWasted = ($duplicateGroups.Values | ForEach-Object { $_.WastedSpace } | Measure-Object -Sum).Sum
-        Write-Log "Total wasted space (duplicates): $([math]::Round($totalWasted / 1GB, 2)) GB" -Level Warning
+    if ($totalDuplicateGroups -gt 0) {
+        Write-Log "Total duplicate files: $totalDuplicateFiles" -Level Warning
     }
+    
+    # Clear hash index to free memory
+    $script:FileHashIndex.Clear()
+    [System.GC]::Collect()
     
     Write-Log "========================================" -Level Information
     Write-Log "Azure File Storage Inventory Scanner completed successfully" -Level Information
